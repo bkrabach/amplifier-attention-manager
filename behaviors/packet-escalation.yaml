@@ -1,0 +1,26 @@
+# packet-escalation — compose into every attention-manager WORKER bundle.
+#
+# Provides the two escalation-bus producers (design: Tier 2):
+#   - tool-request-decision   (producer #1): multi-option decision escalation
+#   - hooks-packet-approval   (producer #2): permission gates (binary allow/deny)
+#
+# Both modules write packets to the shared disk queue ($ATTENTION_QUEUE_DIR,
+# default ~/.amplifier/attention/queue) and await resolution. The on-disk
+# packet format is the contract: see context/packet-schema.md in this repo.
+#
+# Sources are canonical GitHub URLs — DTU tooling rewrites these to Gitea
+# mirrors; local development uses source overrides (settings.yaml or
+# AMPLIFIER_MODULE_* env vars), never edits here.
+
+bundle:
+  name: packet-escalation
+  version: 0.1.0
+  description: Escalation-bus producers (decision tool + packet-writing approval provider) for attention-manager workers
+
+tools:
+  - module: tool-request-decision
+    source: git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=modules/tool-request-decision
+
+hooks:
+  - module: hooks-packet-approval
+    source: git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=modules/hooks-packet-approval

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Amplifier evaluation artifacts
+.amplifier/evaluation/
+
+# Local packet queues (never commit queue state)
+queue/
+.attention-queue*/

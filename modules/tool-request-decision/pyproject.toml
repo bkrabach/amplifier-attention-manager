@@ -1,0 +1,17 @@
+[project]
+name = "amplifier-module-tool-request-decision"
+version = "0.1.0"
+description = "Worker-callable decision escalation: writes a packet to the attention queue, awaits resolution, returns the chosen option"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []   # amplifier-core is a peer dependency — do NOT declare it here
+
+[project.entry-points."amplifier.modules"]
+tool-request-decision = "amplifier_module_tool_request_decision:mount"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_module_tool_request_decision"]
