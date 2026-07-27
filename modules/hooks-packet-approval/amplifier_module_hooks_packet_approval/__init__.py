@@ -12,6 +12,20 @@ modules have mounted) it additionally registers itself with the approval hook's
 ``approval.register_provider`` capability if the hooks-approval module is
 composed — the same registration mechanism the app layer uses.
 
+Gate policy (config ``gate_tools``): when the module config lists tool names in
+``gate_tools`` (e.g. ``["bash"]``), mount() registers a ``tool:pre`` policy hook
+that adds those tools to ``session_state["require_approval_tools"]`` — the
+generic policy-module mechanism hooks-approval checks FIRST in
+``_needs_approval()``, regardless of its own config. This is REQUIRED for
+gating to work under amplifier-app-cli: the CLI unconditionally composes the
+modes behavior (``_build_modes_behaviors()`` in the CLI's runtime/config.py)
+AFTER the user bundle, and that behavior sets ``policy_driven_only: true`` on
+hooks-approval, which makes hooks-approval's static ``rules``/``tools`` config
+inert (``_needs_approval()`` returns False before ever reading them). The
+session-state path is the only gating path that survives. Priority is -15:
+after hooks-mode's tool moderation (-20, which REPLACES the set wholesale on
+every evaluation), before hooks-approval's check (-10).
+
 SELF-CONTAINED BRICK: this module implements its own minimal packet IO against
 the on-disk file contract documented in ``context/packet-schema.md`` of the
 amplifier-attention-manager repo. It deliberately does NOT import the
@@ -47,6 +61,7 @@ from typing import Any
 
 from amplifier_core import ApprovalRequest
 from amplifier_core import ApprovalResponse
+from amplifier_core import HookResult
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +74,15 @@ DEFAULT_URGENCY_TIER = "today"  # a permission gate blocks a live worker turn
 
 PROVIDER_CAPABILITY = "attention.packet_approval_provider"
 APPROVAL_REGISTER_CAPABILITY = "approval.register_provider"
+
+# session_state key hooks-approval checks FIRST in _needs_approval(), even when
+# policy_driven_only is set (the modes behavior composed by amplifier-app-cli
+# forces policy_driven_only=true, making all other gating config inert).
+REQUIRE_APPROVAL_STATE_KEY = "require_approval_tools"
+# tool:pre ordering: hooks-mode moderation (-20) REPLACES the session-state set
+# wholesale on every evaluation; hooks-approval reads it at -10. We must write
+# strictly between the two.
+GATE_POLICY_PRIORITY = -15
 
 
 # -- minimal packet IO against the file contract (context/packet-schema.md) ---
@@ -210,14 +234,88 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> dict[
     composed hooks-approval module happens in on_session_ready() (after ALL
     modules have mounted, so mount order cannot matter).
     """
-    provider = PacketApprovalProvider(config or {})
+    config = config or {}
+    provider = PacketApprovalProvider(config)
     coordinator.register_capability(PROVIDER_CAPABILITY, provider)
     logger.info("hooks-packet-approval mounted: registered capability %s", PROVIDER_CAPABILITY)
+
+    gate_tools = [str(t) for t in config.get("gate_tools", [])]
+    if gate_tools:
+        _register_gate_policy(coordinator, gate_tools)
+
     return {
         "name": "hooks-packet-approval",
         "version": "0.1.0",
         "provides": [PROVIDER_CAPABILITY],
     }
+
+
+def _register_gate_policy(coordinator: Any, gate_tools: list[str]) -> None:
+    """Register the tool:pre policy hook that flags ``gate_tools`` for approval.
+
+    Writes the tools into ``session_state["require_approval_tools"]`` — the
+    generic policy-module key that hooks-approval's ``_needs_approval()`` checks
+    FIRST, before (and regardless of) ``policy_driven_only``. This is the only
+    gating path that works under amplifier-app-cli, which composes the modes
+    behavior (``policy_driven_only: true``) after every user bundle.
+
+    Runs at priority -15 on every tool:pre, because hooks-mode's moderation
+    hook (-20) REPLACES the set wholesale on every evaluation; hooks-approval
+    reads it at -10.
+
+    It also RE-ASSERTS the packet provider with hooks-approval on every
+    tool:pre: amplifier-app-cli registers its own console ApprovalProvider via
+    ``approval.register_provider`` AFTER session initialization (i.e. after our
+    ``on_session_ready()`` registration — see the CLI's session_runner.py),
+    which would otherwise silently replace the packet provider. A console
+    provider in a headless worker dies with "EOF when reading a line" and the
+    gate fail-safes to deny instead of writing a packet. Re-registering here is
+    an idempotent attribute set on the approval hook and guarantees the packet
+    provider is in place at the exact moment hooks-approval consults it.
+    """
+    hooks = coordinator.get("hooks")
+    if not hooks:
+        logger.error(
+            "hooks-packet-approval: gate_tools=%s configured but no hooks registry available — "
+            "the permission gate CANNOT be enforced",
+            gate_tools,
+        )
+        return
+
+    async def gate_policy(event: str, data: dict[str, Any]) -> HookResult:
+        session_state = getattr(coordinator, "session_state", None)
+        if session_state is None:
+            logger.error(
+                "hooks-packet-approval: coordinator has no session_state — cannot flag %s for approval",
+                gate_tools,
+            )
+            return HookResult(action="continue")
+        # Read-modify-write: hooks-mode may have replaced the value with a new
+        # set (or cleared it); always union our tools into whatever is current.
+        current: set[str] = set(session_state.get(REQUIRE_APPROVAL_STATE_KEY) or ())
+        current.update(gate_tools)
+        session_state[REQUIRE_APPROVAL_STATE_KEY] = current
+
+        # Re-assert the packet provider (the app layer may have replaced it
+        # with a console provider after on_session_ready — see docstring).
+        provider = coordinator.get_capability(PROVIDER_CAPABILITY)
+        register = coordinator.get_capability(APPROVAL_REGISTER_CAPABILITY)
+        if provider is not None and register is not None:
+            register(provider)
+
+        return HookResult(action="continue")
+
+    hooks.register(
+        "tool:pre",
+        gate_policy,
+        priority=GATE_POLICY_PRIORITY,
+        name="packet-approval-gate-policy",
+    )
+    logger.info(
+        "hooks-packet-approval: gate policy registered for tools %s (priority %d)",
+        gate_tools,
+        GATE_POLICY_PRIORITY,
+    )
 
 
 async def on_session_ready(coordinator: Any) -> None:
