@@ -61,6 +61,14 @@ if phase == "triage":
                "why": "fabricated option", "rule_refs": []})
     elif mode == "missing":
         pass  # write nothing — the session "forgot" the verdict
+    elif mode == "verdict-then-fail":
+        # Valid verdict but nonzero exit — the runner MUST treat this as a
+        # failed attempt (success requires exit 0 AND valid verdict; the
+        # DTU-found bug class is exactly "the exit code lies").
+        write({"packet_id": packet_id, "decision": "recommend",
+               "recommendation": {"option": "B", "rationale": "looks fine", "confidence": "high"},
+               "why": "verdict written but session errored after", "rule_refs": []})
+        sys.exit(1)
     else:
         raise SystemExit(f"unknown FAKE_TRIAGE_MODE {mode}")
 else:  # rule_delta
@@ -230,6 +238,22 @@ class TestFailurePaths:
         assert len(errors) == 2
         assert [e["attempt"] for e in errors] == [1, 2]
         assert [e["retrying"] for e in errors] == [True, False]
+
+    def test_nonzero_exit_with_valid_verdict_is_still_a_failure(self, runner, home, monkeypatch):
+        """Success requires exit 0 AND a valid verdict. A session that writes a
+        perfectly valid verdict but exits nonzero is a failed attempt — the
+        verdict file must never be read past a lying exit code (the inverse of
+        the DTU bug, where a successful turn carried exit 1)."""
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "verdict-then-fail")
+        packet = make_packet()
+        runner.queue.write(packet)
+
+        outcomes = runner.triage_pass()
+        assert [o.outcome for o in outcomes] == ["error"]
+        assert runner.queue.get(packet.id).triage is None  # valid-looking verdict never used
+        errors = events_named(home, "triage:error")
+        assert len(errors) == 2  # one retry max, both logged
+        assert all("exited 1" in e["error"] for e in errors)
 
     def test_retry_succeeds_on_second_attempt(self, runner, home, monkeypatch, tmp_path):
         monkeypatch.setenv("FAKE_TRIAGE_MODE", "fail-then-recommend")

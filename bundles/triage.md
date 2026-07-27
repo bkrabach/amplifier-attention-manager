@@ -30,6 +30,24 @@ session:
 tools:
   - module: tool-filesystem
     source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
+
+# Session persistence — REQUIRED for honest exit codes, not optional polish.
+# amplifier-app-cli's post-run bookkeeping calls SessionStore.get_metadata(),
+# which raises FileNotFoundError("Session '<id>' not found") when the session
+# directory (~/.amplifier/projects/{project}/sessions/{session_id}/) does not
+# exist — turning a successful LLM turn into exit 1 (DTU-reproduced, twice).
+# In foundation runs that directory is created as a side effect of hooks-logging
+# writing events.jsonl (foundation behaviors/logging.yaml composes exactly this
+# module + config; the module mkdir-parents the template path). Composing the
+# same single observer hook here keeps exit codes honest AND makes triage
+# sessions observable via events.jsonl — which the design wants anyway (§Tier 1
+# observation). It is a hook, not a tool: the restricted tool surface stands.
+hooks:
+  - module: hooks-logging
+    source: git+https://github.com/microsoft/amplifier-module-hooks-logging@main
+    config:
+      mode: session-only
+      session_log_template: ~/.amplifier/projects/{project}/sessions/{session_id}/events.jsonl
 ---
 
 <!-- KEEP IN SYNC: agents/triage.md carries this same discipline with agent
