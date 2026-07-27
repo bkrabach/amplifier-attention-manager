@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""attention-manager evaluation harness (build steps 1 + 2).
+"""attention-manager evaluation harness (build steps 1-3).
 
 Runs the scenarios in evals/scenarios/ INSIDE an already-running DTU
 (or any environment reachable via an exec command prefix):
@@ -161,6 +161,106 @@ S4_ASSERTION_NAMES = [
     "ledger-full-story",
 ]
 
+# -- scenario 5 (cold triage) constants ------------------------------------------
+
+S5_TIMEOUT_S = 600.0  # three sequential passes, up to 3 real LLM sessions (+retries)
+S5_SESSION_TIMEOUT_S = 180.0  # per-LLM-session budget passed via `triage --timeout`
+S5_TRIAGE_EXEC_TIMEOUT_S = 500.0  # local budget for one synchronous `triage --once` exec
+
+S5_SEED_RULE = "Prefer option ids whose consequence mentions lower operational risk when confidence is otherwise equal."
+
+# The design's five rulebook sections, canonical order (rulebook.py SECTIONS —
+# duplicated deliberately: the harness runs on the host and must not import the repo).
+S5_RULEBOOK_SECTIONS = (
+    "Attention priorities",
+    "Auto-answer rules",
+    "Escalation thresholds",
+    "Edge cases",
+    "When you cannot proceed",
+)
+
+S5_RULEBOOK_CONTENT = f"""\
+# Attention Manager Rulebook
+
+Read by every triage pass (packet + THIS FILE only — cold). Every human answer
+should compound into a rule here: answered once, rule added, same class never
+asked again. Rules are single sentences under a section, as `- ` bullets.
+
+## Attention priorities
+
+_What reaches the human first, and in what order. Highest-signal rules only._
+
+## Auto-answer rules
+
+_What the manager may decide itself, with explicit bounds. Phase 1: these are
+recommendations only — nothing is auto-answered._
+
+- {S5_SEED_RULE}
+
+## Escalation thresholds
+
+_When a routine situation stops being routine and must surface to the human._
+
+## Edge cases
+
+_Known exceptions to the rules above. If this section grows fast, a rule above
+is badly written._
+
+## When you cannot proceed
+
+_What to do when no rule applies: bounce malformed packets, surface genuine
+decisions with a why. Never invent an answer._
+"""
+
+# Seeds P1 (cold-decidable, NO producer recommendation) + P2 (cold-undecidable
+# by construction) via the ROOT queue lib; prints the two ids in order.
+S5_SEED_PACKETS_SCRIPT = """\
+from attention_manager.packet import Option, Packet, Source
+from attention_manager.queue import PacketQueue
+
+q = PacketQueue()
+p1 = Packet(
+    question="Choose rollout strategy for the config change",
+    options=[
+        Option(id="A", label="big-bang rollout", consequence="faster but riskier"),
+        Option(id="B", label="staged rollout", consequence="slower, lower operational risk"),
+    ],
+    source=Source(kind="decision"),
+    context=(
+        "The change updates the config parser. Downstream consumers auto-reload config. "
+        "A big-bang rollout completes in one deploy, but a regression would hit all "
+        "consumers at once. A staged rollout takes three deploys over two days with "
+        "canary checks at each stage. There is no deadline pressure this week, and "
+        "confidence in the change itself is equal between the two options."
+    ),
+)
+p2 = Packet(
+    question="Proceed with the approach we discussed earlier?",
+    options=[Option(id="yes", label="Yes"), Option(id="no", label="No")],
+    source=Source(kind="decision"),
+    context="",
+)
+q.write(p1)
+q.write(p2)
+print(p1.id)
+print(p2.id)
+"""
+
+S5_ASSERTION_NAMES = [
+    "rulebook-seeded",
+    "packets-seeded",
+    "triage-pass-1-ok",
+    "p1-recommended-pending",
+    "p2-bounced",
+    "events-triage",
+    "ledger-triage",
+    "answer-opposite-accepted",
+    "triage-pass-2-ok",
+    "one-rule-delta-record",
+    "third-pass-idempotent",
+    "rulebook-apply-branch",
+]
+
 CNE = "could-not-evaluate"
 
 # CSI + OSC ANSI escape sequences (tmux pipe-pane logs carry terminal control codes).
@@ -271,6 +371,16 @@ SPECS = {
         bundle_rel="bundles/test-worker.md",
         answer_option="",  # per-worker answers; see S4_WORKERS
         timeout_s=S4_TIMEOUT_S,
+    ),
+    5: ScenarioSpec(
+        number=5,
+        slug="s5-cold-triage",
+        title="Scenario 5 — cold triage pass (step 3)",
+        kind="decision",
+        prompt="",  # packets are seeded directly; see S5_SEED_PACKETS_SCRIPT
+        bundle_rel="bundles/triage.md",
+        answer_option="",  # answer is the OPPOSITE of triage's recommendation
+        timeout_s=S5_TIMEOUT_S,
     ),
 }
 
@@ -412,6 +522,41 @@ def cmd_tmux_kill(session: str) -> str:
 
 def cmd_ledger_cat(home: str) -> str:
     return f"cat {shlex.quote(home)}/ledger/*.jsonl 2>/dev/null || true"
+
+
+# -- scenario-5 command builders (cold triage) --------------------------------------
+
+
+def cmd_seed_rulebook(home: str) -> str:
+    """Write the seeded rulebook (template + seed rule) and echo it back for grading."""
+    rulebook_path = f"{home}/rulebook.md"
+    return (
+        f"mkdir -p {shlex.quote(home)} && "
+        f"printf %s {shlex.quote(S5_RULEBOOK_CONTENT)} > {shlex.quote(rulebook_path)} && "
+        f"cat {shlex.quote(rulebook_path)}"
+    )
+
+
+def cmd_seed_packets(cfg: Config, queue_dir: str) -> str:
+    """Seed P1/P2 via the ROOT queue lib (repo src on PYTHONPATH); prints both ids."""
+    src = shlex.quote(f"{cfg.repo_dir}/src")
+    return (
+        f"{_env_prefix(queue_dir)} export PYTHONPATH={src}${{PYTHONPATH:+:$PYTHONPATH}}; "
+        f"mkdir -p {shlex.quote(queue_dir)} && python3 -c {shlex.quote(S5_SEED_PACKETS_SCRIPT)}"
+    )
+
+
+def cmd_triage_once(cfg: Config, queue_dir: str, home: str, bundle_uri: str, out_log: str) -> str:
+    """One synchronous cold-triage pass; stdout+stderr tee'd to an in-DTU log."""
+    return (
+        f"{_env_prefix(queue_dir, home)} {cfg.am_cli} triage --once "
+        f"--bundle {shlex.quote(bundle_uri)} --timeout {S5_SESSION_TIMEOUT_S:g} "
+        f"2>&1 | tee {shlex.quote(out_log)}; exit ${{PIPESTATUS[0]}}"
+    )
+
+
+def cmd_rulebook_apply(cfg: Config, queue_dir: str, home: str, proposal_id: str) -> str:
+    return f"{_env_prefix(queue_dir, home)} {cfg.am_cli} rulebook apply {shlex.quote(proposal_id)}"
 
 
 # -- exec layer --------------------------------------------------------------------
@@ -902,10 +1047,10 @@ def _map_packets_to_workers(packets: list[dict[str, Any]]) -> dict[str, dict[str
     return mapping if set(mapping) == set(S4_WORKERS) else None
 
 
-def _cne_rest_s4(s: Scenario, reason: str) -> None:
-    """FAIL every not-yet-recorded S4 assertion as could-not-evaluate."""
+def _cne_rest(s: Scenario, names: list[str], reason: str) -> None:
+    """FAIL every not-yet-recorded assertion in `names` as could-not-evaluate."""
     recorded = {a.name for a in s.assertions}
-    for name in S4_ASSERTION_NAMES:
+    for name in names:
         if name not in recorded:
             s.cne(name, reason)
 
@@ -954,12 +1099,12 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
         )
         if launch.rc != 0:
             s.cne("supervisor-started", f"launch rc={launch.rc}, stderr={launch.stderr.strip()!r}")
-            _cne_rest_s4(s, "supervisor never started")
+            _cne_rest(s, S4_ASSERTION_NAMES, "supervisor never started")
             return _finish(s, started)
         pid = _poll_pgid_file(s.ex, sup_pgid_file, "supervisor-pgid-read")
         if pid is None:
             s.cne("supervisor-started", f"supervisor.pgid never appeared (launch stdout {launch.stdout.strip()!r})")
-            _cne_rest_s4(s, "supervisor never started")
+            _cne_rest(s, S4_ASSERTION_NAMES, "supervisor never started")
             return _finish(s, started)
         sup_pids.append(pid)
         s.check("supervisor-started", True, f"supervisor pgid {pid} (from supervisor.pgid)")
@@ -978,7 +1123,7 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
             dispatch_ok = dispatch_ok and result.rc == 0
         s.check("workers-dispatched", dispatch_ok, "; ".join(dispatch_details))
         if not dispatch_ok:
-            _cne_rest_s4(s, "dispatch failed")
+            _cne_rest(s, S4_ASSERTION_NAMES, "dispatch failed")
             return _finish(s, started)
 
         # 3. Both tmux sessions exist.
@@ -1010,7 +1155,7 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
         packets = _poll(s, PACKET_WAIT_S, poll_two_packets)
         if packets is None:
             s.cne("two-decision-packets", f"fewer than 2 kind={spec.kind} packets within {PACKET_WAIT_S:.0f}s")
-            _cne_rest_s4(s, "packets never appeared")
+            _cne_rest(s, S4_ASSERTION_NAMES, "packets never appeared")
             return _finish(s, started)
         packet_ids = sorted(str(p.get("id", "")) for p in packets)
         s.check("two-decision-packets", len(packets) == 2, f"count={len(packets)}, ids={packet_ids}")
@@ -1117,7 +1262,7 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
         if mapping is None:
             questions = {str(p.get("id")): str(p.get("question", ""))[:80] for p in packets}
             s.cne("packet-worker-mapping", f"ambiguous/incomplete tag+keyword mapping; questions={questions}")
-            _cne_rest_s4(s, "cannot answer without a packet->worker mapping")
+            _cne_rest(s, S4_ASSERTION_NAMES, "cannot answer without a packet->worker mapping")
             return _finish(s, started)
         mapping_detail = {name: str(pkt.get("id")) for name, pkt in mapping.items()}
         s.check("packet-worker-mapping", True, f"{mapping_detail}")
@@ -1237,6 +1382,276 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
             s.ex.run(cmd_tmux_kill(str(w["session"])), label=f"cleanup-kill-{w['session']}")
 
 
+# -- scenario 5: cold triage pass (step 3) -------------------------------------------
+
+
+def _collect_s5_artifacts(s: Scenario, home: str) -> None:
+    """Best-effort artifact collection — runs even when the scenario bails early."""
+    session_logs_cmd = (
+        f'for f in {shlex.quote(home)}/triage/*/*; do echo "=== $f ==="; cat "$f"; echo; done 2>/dev/null || true'
+    )
+    artifacts = [
+        ("rulebook-after", cmd_cat(f"{home}/rulebook.md"), "rulebook-after.md"),
+        ("proposals", cmd_cat(f"{home}/rulebook-proposals.jsonl"), "rulebook-proposals.jsonl"),
+        ("events", cmd_cat(f"{home}/events.jsonl"), "events.jsonl"),
+        ("ledger", cmd_ledger_cat(home), "ledger.jsonl"),
+        ("triage-sessions", session_logs_cmd, "triage-sessions.log"),
+    ]
+    for label, cmd, filename in artifacts:
+        try:
+            result = s.ex.run(cmd, label=f"artifact-{label}")
+            if result.rc == 0:
+                (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
+        except Exception as e:  # artifact collection must never mask the verdict
+            print(f"    (artifact {label} not collected: {e})")
+
+
+def _read_packet_file(s: Scenario, path: str, label: str) -> dict[str, Any] | None:
+    result = s.ex.run(cmd_cat(path), label=label)
+    if result.rc != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _rulebook_section_body(content: str, section: str) -> str | None:
+    """Return the text under '## <section>' up to the next '## ' heading."""
+    marker = f"## {section}"
+    lines = content.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == marker), None)
+    if start is None:
+        return None
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _s5_triage_pass(s: Scenario, cfg: Config, home: str, bundle_uri: str, n: int) -> ExecResult:
+    """Run `triage --once` pass N; persist its stdout as an artifact."""
+    out_log = f"{s.dtu_sdir}/triage-pass-{n}.out"
+    result = s.ex.run(
+        cmd_triage_once(cfg, s.queue_dir, home, bundle_uri, out_log),
+        label=f"triage-pass-{n}",
+        timeout=min(S5_TRIAGE_EXEC_TIMEOUT_S, max(30.0, s.remaining())),
+    )
+    (s.out_dir / f"triage-pass-{n}.out").write_text(result.stdout, encoding="utf-8")
+    return result
+
+
+def run_scenario_5(cfg: Config) -> ScenarioResult:
+    spec = SPECS[5]
+    s = Scenario(cfg, spec)
+    started = time.monotonic()
+    home = f"{s.dtu_sdir}/home"
+    bundle_uri = f"file://{cfg.repo_dir}/{spec.bundle_rel}"
+    try:
+        # 1. Seed the rulebook (template + seed rule) and grade the readback.
+        seeded = s.ex.run(cmd_seed_rulebook(home), label="seed-rulebook")
+        (s.out_dir / "rulebook-before.md").write_text(seeded.stdout, encoding="utf-8")
+        headings_ok = all(f"## {sec}" in seeded.stdout for sec in S5_RULEBOOK_SECTIONS)
+        if not s.check(
+            "rulebook-seeded",
+            seeded.rc == 0 and S5_SEED_RULE in seeded.stdout and headings_ok,
+            f"rc={seeded.rc}, seed rule present={S5_SEED_RULE in seeded.stdout}, all 5 headings={headings_ok}",
+        ):
+            _cne_rest(s, S5_ASSERTION_NAMES, "rulebook seeding failed")
+            return _finish(s, started)
+
+        # 2. Seed P1/P2 via the root queue lib; ids print in order.
+        seeded_p = s.ex.run(cmd_seed_packets(cfg, s.queue_dir), label="seed-packets")
+        ids = [ln.strip() for ln in seeded_p.stdout.splitlines() if ln.strip().startswith("pkt-")]
+        if not s.check(
+            "packets-seeded",
+            seeded_p.rc == 0 and len(ids) == 2 and ids[0] != ids[1],
+            f"rc={seeded_p.rc}, ids={ids}, stderr={seeded_p.stderr.strip()[:200]!r}",
+        ):
+            _cne_rest(s, S5_ASSERTION_NAMES, "packet seeding failed")
+            return _finish(s, started)
+        p1, p2 = ids
+        s.snapshot("post-seed", s.ex.run(cmd_queue_list(cfg, s.queue_dir), label="queue-list-post-seed"))
+
+        # 3. Pass 1 — real LLM triage on both packets (synchronous).
+        pass1 = _s5_triage_pass(s, cfg, home, bundle_uri, 1)
+        s.check(
+            "triage-pass-1-ok",
+            pass1.rc == 0,
+            f"rc={pass1.rc} (rc==0 means the pass ran; per-packet verdicts are graded below) "
+            f"stdout tail: {pass1.stdout.strip()[-300:]!r}",
+        )
+
+        # 4. P1: recommended, still pending, triage fields filled.
+        p1_packet = _read_packet_file(s, f"{s.queue_dir}/pending/{p1}.json", "p1-pending-read")
+        rec_opt: str | None = None
+        if p1_packet is None:
+            elsewhere = s.ex.run(cmd_queue_show(cfg, s.queue_dir, p1), label="p1-locate")
+            s.check(
+                "p1-recommended-pending",
+                False,
+                f"pending/{p1}.json missing/unparseable — queue show says: {elsewhere.stdout.strip()[:300]!r}",
+            )
+        else:
+            (s.out_dir / "p1-pending.json").write_text(json.dumps(p1_packet, indent=2), encoding="utf-8")
+            triage = p1_packet.get("triage") or {}
+            recommendation = p1_packet.get("recommendation") or {}
+            rec_opt = recommendation.get("option")
+            s.check(
+                "p1-recommended-pending",
+                triage.get("handled_by") == "manager-recommend"
+                and bool(str(triage.get("why", "")).strip())
+                and isinstance(triage.get("rule_refs"), list)
+                and rec_opt in ("A", "B"),
+                f"triage={{handled_by: {triage.get('handled_by')!r}, why: {str(triage.get('why', ''))[:120]!r}, "
+                f"rule_refs: {triage.get('rule_refs')!r}}}, recommendation.option={rec_opt!r}",
+            )
+
+        # 5. P2: bounced with a reason; pending entry gone.
+        p2_packet = _read_packet_file(s, f"{s.queue_dir}/bounced/{p2}.json", "p2-bounced-read")
+        if p2_packet is None:
+            elsewhere = s.ex.run(cmd_queue_show(cfg, s.queue_dir, p2), label="p2-locate")
+            s.check(
+                "p2-bounced",
+                False,
+                f"bounced/{p2}.json missing/unparseable — queue show says: {elsewhere.stdout.strip()[:300]!r}",
+            )
+        else:
+            (s.out_dir / "p2-bounced.json").write_text(json.dumps(p2_packet, indent=2), encoding="utf-8")
+            p2_why = str((p2_packet.get("triage") or {}).get("why", ""))
+            bounce_reason = p2_why.split("bounce:", 1)[1].strip() if "bounce:" in p2_why else ""
+            p2_pending_gone = s.ex.run(cmd_file_absent(f"{s.queue_dir}/pending/{p2}.json"), label="p2-pending-absent")
+            s.check(
+                "p2-bounced",
+                bool(bounce_reason) and p2_pending_gone.stdout.strip() == "absent",
+                f"bounce reason={bounce_reason[:150]!r}, pending entry: {p2_pending_gone.stdout.strip()}",
+            )
+
+        # 6. Events: exactly 1 recommended(P1) + 1 bounced(P2); errors recorded in detail.
+        events, malformed = _fetch_events(s, home)
+        recommended = [e for e in _events_named(events, "triage:recommended") if e.get("packet_id") == p1]
+        bounced = [e for e in _events_named(events, "triage:bounced") if e.get("packet_id") == p2]
+        n_errors = len(_events_named(events, "triage:error"))
+        s.check(
+            "events-triage",
+            len(recommended) == 1 and len(bounced) == 1,
+            f"triage:recommended(P1)={len(recommended)}, triage:bounced(P2)={len(bounced)}, "
+            f"triage:error={n_errors} (retries are loud, not failures), malformed lines={malformed}",
+        )
+
+        # 7. Ledger records the triage story.
+        ledger_records, _ = _parse_jsonl(s.ex.run(cmd_ledger_cat(home), label="ledger-fetch-1").stdout)
+        kinds: dict[str, int] = {}
+        for record in ledger_records:
+            kind = str(record.get("kind"))
+            kinds[kind] = kinds.get(kind, 0) + 1
+        s.check(
+            "ledger-triage",
+            kinds.get("triage_recommended", 0) == 1 and kinds.get("triage_bounced", 0) == 1,
+            f"kinds={kinds}",
+        )
+
+        # 8. Answer P1 with the OPPOSITE of triage's recommendation.
+        if rec_opt not in ("A", "B"):
+            s.cne("answer-opposite-accepted", "no valid triage recommendation on P1 to oppose")
+            _cne_rest(s, S5_ASSERTION_NAMES, "cannot proceed without an answered P1")
+            return _finish(s, started)
+        opposite = "B" if rec_opt == "A" else "A"
+        answer = s.answer(p1, opposite)
+        s.check(
+            "answer-opposite-accepted",
+            answer.rc == 0,
+            f"triage recommended {rec_opt} -> answered {opposite} (rc={answer.rc}, "
+            f"stderr={answer.stderr.strip()[:150]!r})",
+        )
+        p1_answered = _read_packet_file(s, f"{s.queue_dir}/answered/{p1}.json", "p1-answered-read")
+        if p1_answered is not None:
+            (s.out_dir / "p1-answered.json").write_text(json.dumps(p1_answered, indent=2), encoding="utf-8")
+
+        # 9. Pass 2 — rule_delta for the answered P1.
+        pass2 = _s5_triage_pass(s, cfg, home, bundle_uri, 2)
+        s.check("triage-pass-2-ok", pass2.rc == 0, f"rc={pass2.rc}, stdout tail: {pass2.stdout.strip()[-300:]!r}")
+
+        # 10. Exactly ONE rule_delta record for P1 (proposal or explicit none).
+        proposals_raw = s.ex.run(cmd_cat(f"{home}/rulebook-proposals.jsonl"), label="proposals-fetch-1")
+        records, bad = _parse_jsonl(proposals_raw.stdout if proposals_raw.rc == 0 else "")
+        p1_records = [r for r in records if r.get("packet_id") == p1]
+        branch: str | None = None
+        proposal_record: dict[str, Any] | None = None
+        if len(p1_records) != 1:
+            s.check(
+                "one-rule-delta-record",
+                False,
+                f"expected exactly 1 record for P1, got {len(p1_records)} "
+                f"(file rc={proposals_raw.rc}, total records={len(records)}, malformed={bad})",
+            )
+        else:
+            record = p1_records[0]
+            status = record.get("status")
+            if status == "proposed":
+                branch = "proposal"
+                proposal_record = record
+                ok = bool(str(record.get("sentence", "")).strip()) and record.get("section") in S5_RULEBOOK_SECTIONS
+                s.check(
+                    "one-rule-delta-record",
+                    ok,
+                    f"branch=proposal; section={record.get('section')!r}, "
+                    f"sentence={str(record.get('sentence', ''))[:120]!r}",
+                )
+            elif status == "none":
+                branch = "none"
+                ok = bool(str(record.get("reason", "")).strip())
+                s.check(
+                    "one-rule-delta-record",
+                    ok,
+                    f"branch=none (explicit one-off); reason={str(record.get('reason', ''))[:150]!r}",
+                )
+            else:
+                s.check("one-rule-delta-record", False, f"unexpected record status {status!r}: {record}")
+
+        # 11. Pass 3 — idempotency: P1's record count unchanged.
+        pass3 = _s5_triage_pass(s, cfg, home, bundle_uri, 3)
+        records_after, _ = _parse_jsonl(
+            s.ex.run(cmd_cat(f"{home}/rulebook-proposals.jsonl"), label="proposals-fetch-2").stdout
+        )
+        p1_after = [r for r in records_after if r.get("packet_id") == p1]
+        s.check(
+            "third-pass-idempotent",
+            pass3.rc == 0 and len(p1_after) == len(p1_records) == 1,
+            f"pass3 rc={pass3.rc}, P1 record count before={len(p1_records)} after={len(p1_after)}",
+        )
+
+        # 12. Apply branch.
+        if branch == "proposal" and proposal_record is not None:
+            proposal_id = str(proposal_record.get("id"))
+            target_section = str(proposal_record.get("section"))
+            sentence = str(proposal_record.get("sentence", "")).strip()
+            applied = s.ex.run(cmd_rulebook_apply(cfg, s.queue_dir, home, proposal_id), label="rulebook-apply")
+            rulebook_after = s.ex.run(cmd_cat(f"{home}/rulebook.md"), label="rulebook-after-read")
+            section_body = _rulebook_section_body(rulebook_after.stdout, target_section)
+            landed = section_body is not None and f"- {sentence}" in section_body
+            s.check(
+                "rulebook-apply-branch",
+                applied.rc == 0 and landed,
+                f"branch=proposal; apply rc={applied.rc}, sentence under '## {target_section}': {landed} "
+                f"(stderr={applied.stderr.strip()[:150]!r})",
+            )
+        elif branch == "none":
+            s.check(
+                "rulebook-apply-branch",
+                True,
+                "branch=none — explicit none-record with non-empty reason is a valid Phase-1 outcome; nothing to apply",
+            )
+        else:
+            s.cne("rulebook-apply-branch", "no valid rule_delta record to apply (see one-rule-delta-record)")
+        return _finish(s, started)
+    finally:
+        _collect_s5_artifacts(s, home)
+
+
 def _grade_decision_schema(show: ExecResult) -> tuple[bool, str]:
     if show.rc != 0:
         return False, f"queue show rc={show.rc} stderr={show.stderr.strip()!r}"
@@ -1261,7 +1676,7 @@ def _finish(s: Scenario, started: float) -> ScenarioResult:
     return result
 
 
-RUNNERS = {1: run_scenario_1, 2: run_scenario_2, 3: run_scenario_3, 4: run_scenario_4}
+RUNNERS = {1: run_scenario_1, 2: run_scenario_2, 3: run_scenario_3, 4: run_scenario_4, 5: run_scenario_5}
 
 
 # -- dry-run planner --------------------------------------------------------------------
@@ -1350,6 +1765,61 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     return steps
 
 
+def _plan_scenario_5(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[str, str]]:
+    home = f"{dtu_sdir}/home"
+    bundle_uri = f"file://{cfg.repo_dir}/{SPECS[5].bundle_rel}"
+    p1, prop = "<P1_PACKET_ID>", "<PROPOSAL_ID>"
+    return [
+        (
+            "seed rulebook: 5-section template + seed rule under '## Auto-answer rules' (echoed back for grading)",
+            cmd_seed_rulebook(home),
+        ),
+        (
+            "seed P1 (cold-decidable, no producer recommendation) + P2 (cold-undecidable) via the ROOT queue lib; prints both ids",
+            cmd_seed_packets(cfg, queue_dir),
+        ),
+        (
+            f"pass 1: real-LLM cold triage on both packets (synchronous; per-session --timeout {S5_SESSION_TIMEOUT_S:g}s; "
+            f"exec budget {S5_TRIAGE_EXEC_TIMEOUT_S:.0f}s)",
+            cmd_triage_once(cfg, queue_dir, home, bundle_uri, f"{dtu_sdir}/triage-pass-1.out"),
+        ),
+        (
+            "grade P1: still pending, triage.handled_by=manager-recommend, why non-empty, rule_refs list, "
+            "recommendation.option in {A,B}",
+            cmd_cat(f"{queue_dir}/pending/{p1}.json"),
+        ),
+        (
+            "grade P2: in bounced/ with non-empty 'bounce:' reason in triage.why (+ pending entry gone)",
+            cmd_cat(f"{queue_dir}/bounced/<P2_PACKET_ID>.json"),
+        ),
+        ("grade events: exactly 1 triage:recommended(P1) + 1 triage:bounced(P2)", cmd_cat(f"{home}/events.jsonl")),
+        ("grade ledger: triage_recommended x1 + triage_bounced x1", cmd_ledger_cat(home)),
+        (
+            "answer P1 with the OPPOSITE of triage's recommendation (grader records which way)",
+            cmd_answer(cfg, queue_dir, p1, "<OPPOSITE_OPTION>", "eval"),
+        ),
+        (
+            "pass 2: rule_delta for the answered P1",
+            cmd_triage_once(cfg, queue_dir, home, bundle_uri, f"{dtu_sdir}/triage-pass-2.out"),
+        ),
+        (
+            "grade proposals: exactly ONE record for P1 — proposal {sentence, section in the 5} OR explicit "
+            "none {reason}; branch recorded",
+            cmd_cat(f"{home}/rulebook-proposals.jsonl"),
+        ),
+        (
+            "pass 3: idempotency — P1's record count must be unchanged",
+            cmd_triage_once(cfg, queue_dir, home, bundle_uri, f"{dtu_sdir}/triage-pass-3.out"),
+        ),
+        ("re-read proposals for the idempotency count", cmd_cat(f"{home}/rulebook-proposals.jsonl")),
+        (
+            "apply branch (proposal only): apply the rule, then assert the sentence sits under the target section",
+            cmd_rulebook_apply(cfg, queue_dir, home, prop),
+        ),
+        ("read rulebook after apply (section-scoped sentence match)", cmd_cat(f"{home}/rulebook.md")),
+    ]
+
+
 def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
     dtu_sdir = f"{cfg.work_dir}/{cfg.run_id}/{spec.slug}"
     queue_dir = f"{dtu_sdir}/queue"
@@ -1357,6 +1827,8 @@ def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
     pkt, pid = "<PACKET_ID>", "<PID>"
     if spec.number == 4:
         return _plan_scenario_4(cfg, dtu_sdir, queue_dir)
+    if spec.number == 5:
+        return _plan_scenario_5(cfg, dtu_sdir, queue_dir)
     steps: list[tuple[str, str]] = [
         (
             "launch worker in background (own process group; stdout+stderr -> worker.log; "
@@ -1468,7 +1940,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--output-dir", default=None, help=f"results directory (default: {DEFAULT_OUTPUT_ROOT}/<UTC ts>)"
     )
     parser.add_argument(
-        "--scenario", action="append", choices=["1", "2", "3", "4"], help="run only this scenario (repeatable)"
+        "--scenario", action="append", choices=["1", "2", "3", "4", "5"], help="run only this scenario (repeatable)"
     )
     parser.add_argument("--dry-run", action="store_true", help="print planned command sequences; no DTU required")
     parser.add_argument(
@@ -1484,7 +1956,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4"])})
+    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4", "5"])})
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_ROOT) / run_id
     cfg = Config(

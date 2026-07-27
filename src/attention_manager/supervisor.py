@@ -47,9 +47,11 @@ from .notify import parse_sink
 from .packet import Packet
 from .queue import PacketQueue
 from .state import SupervisorState
+from .triage import TriageRunner
 from .workers import Observation
 
 DEFAULT_INTERVAL_S = 2.0
+DEFAULT_TRIAGE_EVERY_TICKS = 15
 LOCK_FILENAME = "supervisor.lock"
 
 
@@ -86,6 +88,8 @@ class Supervisor:
         batch_max: int | None = None,
         list_sessions: Callable[[], list[str]] | None = None,
         observe: Callable[[str, Path], Observation] | None = None,
+        triage_every: int | None = None,
+        triage_runner: TriageRunner | None = None,
         err: TextIO | None = None,
     ):
         self.state = SupervisorState(home)
@@ -99,6 +103,13 @@ class Supervisor:
         self._warned_no_sink = False
         self._reported_bad_files: set[str] = set()
         self._lock_fd: int | None = None
+        # Triage integration (design step 3, Phase 1 recommend-only). OFF by
+        # default: triage_every = run one pass every N ticks when set.
+        self.triage_every = triage_every
+        self.triage_runner = triage_runner
+        if self.triage_every is not None and self.triage_runner is None:
+            self.triage_runner = TriageRunner(queue=self.queue, state=self.state, err=self._err)
+        self._tick_count = 0
 
         self.batcher: NotificationBatcher | None = None
         if notify_spec:
@@ -296,11 +307,32 @@ class Supervisor:
             os.close(self._lock_fd)
             self._lock_fd = None
 
+    # -- triage (design step 3, Phase 1 recommend-only) --------------------------------
+
+    def _maybe_triage(self) -> None:
+        """Run one triage pass every ``triage_every`` ticks (first tick counts).
+
+        Per-packet failures are handled (loudly) inside the runner; anything
+        that escapes here is a system failure — reported loud, loop keeps
+        running (non-interference: triage trouble must not kill supervision).
+        """
+        if self.triage_every is None or self.triage_runner is None:
+            return
+        if self._tick_count % self.triage_every != 0:
+            return
+        try:
+            self.triage_runner.triage_pass()
+        except Exception as e:  # noqa: BLE001 — boundary: keep the loop alive, loudly
+            self.state.append_event("triage:error", error=f"triage pass crashed: {e}")
+            print(f"ERROR: triage pass crashed: {e}", file=self._err)
+
     # -- the loop --------------------------------------------------------------------
 
     def tick(self) -> None:
         self._scan_packets()
         self._observe_workers()
+        self._maybe_triage()
+        self._tick_count += 1
         self._flush_notifications()
         self.state.save()
 
@@ -314,6 +346,8 @@ class Supervisor:
         self._acquire_instance_lock()
         try:
             workers_mod.require_tmux()  # fail loud upfront — no tmux, no supervision
+            if self.triage_runner is not None and self.triage_every is not None:
+                self.triage_runner.preflight()  # fail loud upfront — no amplifier bin, no triage
             if self.batcher is None:
                 self._warn_notifications_disabled()
             self.state.append_event(
@@ -322,6 +356,7 @@ class Supervisor:
                 once=once,
                 queue_root=str(self.queue.root),
                 notify=self.batcher.sink.name if self.batcher is not None else None,
+                triage_every=self.triage_every,
             )
             if once:
                 self.tick()

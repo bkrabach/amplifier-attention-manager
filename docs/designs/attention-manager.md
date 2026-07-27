@@ -322,6 +322,7 @@ paying for."
 | D5 | **State on disk everywhere.** | Queue, packets, rulebook, ledger are files. Resumable by construction; kill at 60% → resume at 60%. No queue state in any context window. |
 | D6 | **Blocked-on-human is owned, not inferred.** | We control the ApprovalProvider — the moment of blockage is our code; we emit `packet:created` ourselves. Tailing events.jsonl is the fallback for sessions we didn't launch. |
 | D7 | **Fail loud, no fallbacks.** | Undecidable triage surfaces with why. Undeclared timeout = pending + loud, never a quiet default. No synthetic "answers." |
+| D8 | **Triage shells out to the installed `amplifier` CLI (one-shot sessions), not embedded foundation.** | Keeps the root package stdlib-only (no git dependency on foundation), reuses the environment's existing provider config (host and DTU both have a working `amplifier`), and the file-based verdict protocol (session WRITES verdict JSON to a runner-provided path; missing/invalid verdict = loud `triage:error`, one logged retry max, never fabricated) keeps all state on disk (D5) with no stdout parsing. Embedded foundation remains the path when the manager later needs long-lived LLM sessions. |
 
 ## Reuse map (don't rebuild)
 
