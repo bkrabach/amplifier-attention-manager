@@ -8,8 +8,11 @@ includes:
   # Provider-agnostic base: tools, orchestrator, context manager. The eval
   # harness / app layer injects the provider at runtime (settings.yaml).
   - bundle: git+https://github.com/microsoft/amplifier-foundation@main
-  # The escalation-bus producers (relative path — resolved against this file's location).
-  - bundle: ../behaviors/packet-escalation.yaml
+  # The escalation-bus producers. Canonical git URL (NOT a relative path):
+  # relative includes escape the bundle root when this file is loaded directly
+  # and are SILENTLY skipped by the loader — proven in DTU validation. The git
+  # URL form resolves everywhere (DTU rewrites it to the Gitea mirror).
+  - bundle: git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=behaviors/packet-escalation.yaml
 ---
 
 # Test Worker
