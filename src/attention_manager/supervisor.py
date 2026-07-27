@@ -2,6 +2,9 @@
 
 Each tick (default 2s):
 
+0. (once, at startup) Acquire the single-instance flock on
+   ``<home>/supervisor.lock`` — at most ONE supervise loop per home, ever.
+   A second supervisor fails loud instead of silently duplicating events.
 1. Re-scan the packet queue (pending/ + answered/ + auto/) and diff against
    the seen-sets → emit ``packet:created`` / ``packet:answered`` events,
    enqueue created packets for notification batching, write ledger entries.
@@ -27,6 +30,8 @@ both for honesty:
 
 from __future__ import annotations
 
+import fcntl
+import os
 import signal
 import sys
 import time
@@ -45,6 +50,7 @@ from .state import SupervisorState
 from .workers import Observation
 
 DEFAULT_INTERVAL_S = 2.0
+LOCK_FILENAME = "supervisor.lock"
 
 
 def _parse_iso(ts: str) -> datetime | None:
@@ -92,6 +98,7 @@ class Supervisor:
         self._stop = False
         self._warned_no_sink = False
         self._reported_bad_files: set[str] = set()
+        self._lock_fd: int | None = None
 
         self.batcher: NotificationBatcher | None = None
         if notify_spec:
@@ -244,6 +251,51 @@ class Supervisor:
                 file=self._err,
             )
 
+    # -- single-instance lock ---------------------------------------------------------
+
+    def _acquire_instance_lock(self) -> None:
+        """Enforce the single-writer invariant (state.py): at most ONE supervise
+        loop per home, ever.
+
+        Rationale (S4 DTU incident): a supervisor that survives a botched kill
+        plus a restarted one both tick against the same home — each emits its
+        own ``packet:answered``/``worker:finished`` events and both write
+        state.json, silently corrupting the record. flock is kernel-owned and
+        dies with the process (even SIGKILL), so the D5 kill/restart path needs
+        no stale-lock handling, while a *surviving* supervisor keeps the lock
+        held — the second instance must fail loud, never double-write.
+        """
+        self.state.home.mkdir(parents=True, exist_ok=True)
+        lock_path = self.state.home / LOCK_FILENAME
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            holder = ""
+            try:
+                holder = os.read(fd, 64).decode("utf-8", "replace").strip()
+            except OSError:
+                pass
+            os.close(fd)
+            raise RuntimeError(
+                f"another supervisor is already running for {self.state.home}"
+                + (f" (lock {lock_path} held by pid {holder})" if holder else f" (lock {lock_path} held)")
+                + ". Two supervisors against one home would duplicate events and corrupt "
+                "state.json (single-writer invariant) — stop the other process first."
+            ) from e
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        self._lock_fd = fd
+
+    def _release_instance_lock(self) -> None:
+        if self._lock_fd is None:
+            return
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
     # -- the loop --------------------------------------------------------------------
 
     def tick(self) -> None:
@@ -257,30 +309,36 @@ class Supervisor:
 
     def run(self, once: bool = False) -> int:
         """Run the loop until SIGINT/SIGTERM (or a single tick with once=True)."""
-        workers_mod.require_tmux()  # fail loud upfront — no tmux, no supervision
-        if self.batcher is None:
-            self._warn_notifications_disabled()
-        self.state.append_event(
-            "supervisor:started",
-            interval_s=self.interval_s,
-            once=once,
-            queue_root=str(self.queue.root),
-            notify=self.batcher.sink.name if self.batcher is not None else None,
-        )
-        if once:
-            self.tick()
-            self.state.append_event("supervisor:stopped", reason="once")
-            self.state.save()
-            return 0
+        # Lock FIRST — before tmux checks and before ANY event/state write. A
+        # second supervisor must leave zero traces in the home it doesn't own.
+        self._acquire_instance_lock()
+        try:
+            workers_mod.require_tmux()  # fail loud upfront — no tmux, no supervision
+            if self.batcher is None:
+                self._warn_notifications_disabled()
+            self.state.append_event(
+                "supervisor:started",
+                interval_s=self.interval_s,
+                once=once,
+                queue_root=str(self.queue.root),
+                notify=self.batcher.sink.name if self.batcher is not None else None,
+            )
+            if once:
+                self.tick()
+                self.state.append_event("supervisor:stopped", reason="once")
+                self.state.save()
+                return 0
 
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        while not self._stop:
-            self.tick()
-            # Sleep in small slices so a signal stops us within ~0.2s.
-            deadline = time.monotonic() + self.interval_s
-            while not self._stop and time.monotonic() < deadline:
-                time.sleep(0.2)
-        self.state.append_event("supervisor:stopped", reason="signal")
-        self.state.save()  # clean flush on shutdown
-        return 0
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+            while not self._stop:
+                self.tick()
+                # Sleep in small slices so a signal stops us within ~0.2s.
+                deadline = time.monotonic() + self.interval_s
+                while not self._stop and time.monotonic() < deadline:
+                    time.sleep(0.2)
+            self.state.append_event("supervisor:stopped", reason="signal")
+            self.state.save()  # clean flush on shutdown
+            return 0
+        finally:
+            self._release_instance_lock()

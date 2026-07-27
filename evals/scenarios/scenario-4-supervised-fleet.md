@@ -28,10 +28,15 @@ References: `docs/designs/attention-manager.md` §Tier 1 + build step 2,
 
 1. **Pre-clean:** `tmux kill-session` for `am-w1`/`am-w2` (best-effort).
 2. **Supervisor up:** background-launch (setsid, own process group; stdout+
-   stderr appended to `supervisor.log`; prints PID):
+   stderr appended to `supervisor.log`):
    `attention-manager supervise --interval 2 --notify file:<sink> --batch-window 30 --batch-max 10`
    (ATTENTION_QUEUE_DIR + ATTENTION_HOME exported in the exec'd command —
-   `dispatch`/`supervise` both need them).
+   `dispatch`/`supervise` both need them). The supervisor's REAL process-group
+   id is written to `supervisor.pgid` from inside the setsid'd session
+   (`echo $$` + `exec`) — the launch line's `$!` is only the wrapping
+   subshell's pid and MUST NOT be used as the kill target (a group kill on
+   `$!` once missed the supervisor entirely; it survived and ran concurrently
+   with the restarted one, duplicating events).
 3. **Dispatch fleet:** `attention-manager dispatch w1 --task '<JSON-vs-YAML
    NEEDS-HUMAN-DECISION task, tag [w1]>' --bundle file://<repo>/bundles/test-worker.md`
    and `w2` (LRU-vs-FIFO, tag `[w2]`). Each task instructs the worker to
@@ -40,9 +45,14 @@ References: `docs/designs/attention-manager.md` §Tier 1 + build step 2,
 4. **Observe (poll 2s, generous budgets — two parallel LLM workers):**
    sessions exist → 2 `kind=decision` packets (≤240s) → exactly 2
    `packet:created` in `$ATTENTION_HOME/events.jsonl` → notifications.
-5. **Durability mid-run:** SIGKILL the supervisor process group; restart with
-   the same flags; wait ~2 ticks; `packet:created` count must STILL be
-   exactly 2 (state.json is authoritative on restart — no re-announce, D5).
+5. **Durability mid-run:** SIGKILL the supervisor process group (pgid from
+   `supervisor.pgid`); VERIFY it is dead (`kill -0`) — a surviving supervisor
+   would run concurrently with the restart and duplicate events (hard FAIL,
+   and the restart is skipped); restart with the same flags; wait ~2 ticks;
+   `packet:created` count must STILL be exactly 2 (state.json is
+   authoritative on restart — no re-announce, D5). The supervisor itself
+   enforces single-instance via an flock on `<home>/supervisor.lock` — a
+   second live supervisor against the same home refuses to start.
 6. **Answer:** w1→A, w2→B via `attention-manager answer` (mapping via tag,
    domain-keyword fallback; unresolvable mapping = FAIL could-not-evaluate).
 7. **Unblock + full story:** both worker.logs
@@ -59,20 +69,22 @@ References: `docs/designs/attention-manager.md` §Tier 1 + build step 2,
 
 | # | Assertion | Check |
 |---|-----------|-------|
-| 1 | `supervisor-started` | background launch printed a valid PID |
+| 1 | `supervisor-started` | `supervisor.pgid` appeared with the supervisor's real process-group id |
 | 2 | `workers-dispatched` | both `dispatch` commands exit 0 |
 | 3 | `tmux-sessions-exist` | `am-w1` AND `am-w2` exist (`tmux has-session`) |
 | 4 | `two-decision-packets` | exactly 2 `kind=decision` packets pending within 240s |
 | 5 | `events-packet-created-x2` | events.jsonl contains exactly 2 `packet:created` |
 | 6 | `all-created-packets-notified` | every non-empty sink line parses as a batch record (`count` + `packets[]`), and BOTH created packet ids appear across batch records (≤120s after both packets seen) |
-| 7 | `restart-no-duplicate-events` | after SIGKILL + restart + ~2 ticks, `packet:created` count is STILL exactly 2 |
-| 8 | `packet-worker-mapping` | each packet maps to exactly one worker (tag `[w1]`/`[w2]`, keyword fallback) |
-| 9 | `answers-accepted` | `answer <w1-pkt> A` and `answer <w2-pkt> B` both exit 0 |
-| 10 | `w1-received-A` | am-w1 worker.log contains `DECISION RECEIVED: A` (≤180s, ANSI-stripped) |
-| 11 | `w2-received-B` | am-w2 worker.log contains `DECISION RECEIVED: B` (≤180s, ANSI-stripped) |
-| 12 | `events-packet-answered-x2-latency` | exactly 2 `packet:answered`, each with non-null `latency_s` |
-| 13 | `events-worker-finished-x2-judged-false` | exactly 2 `worker:finished`, each `judged == false` and `exit_code == 0` |
-| 14 | `ledger-full-story` | ledger kinds: dispatched=2, packet_created=2, packet_answered=2, worker_finished=2, notified_batch>=1 |
+| 7 | `supervisor-killed` | after the SIGKILL, `kill -0` on the supervisor's pgid reports dead (a survivor would run concurrently with the restart and duplicate events) |
+| 8 | `restart-no-duplicate-events` | after SIGKILL + restart + ~2 ticks, `packet:created` count is STILL exactly 2 |
+| 9 | `packet-worker-mapping` | each packet maps to exactly one worker (tag `[w1]`/`[w2]`, keyword fallback) |
+| 10 | `answers-accepted` | `answer <w1-pkt> A` and `answer <w2-pkt> B` both exit 0 |
+| 11 | `w1-received-A` | am-w1 worker.log contains `DECISION RECEIVED: A` (≤180s, ANSI-stripped) |
+| 12 | `w2-received-B` | am-w2 worker.log contains `DECISION RECEIVED: B` (≤180s, ANSI-stripped) |
+| 13 | `events-packet-answered-x2-latency` | exactly 2 `packet:answered`, covering BOTH packet ids, each with non-null `latency_s` |
+| 14 | `events-worker-finished-x2-judged-false` | exactly 2 `worker:finished`, covering BOTH sessions (`am-w1` AND `am-w2`), each `judged == false` and `exit_code == 0` |
+| 15 | `events-no-duplicates` | no `(event, packet_id)` pair appears more than once for `packet:created`/`packet:answered` — a duplicate is the signature of two supervisors writing one home |
+| 16 | `ledger-full-story` | ledger kinds: dispatched=2, packet_created=2, packet_answered=2, worker_finished=2, notified_batch>=1 |
 
 ## The ONE-batch check (soft, honest)
 

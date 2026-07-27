@@ -25,6 +25,14 @@ Concurrency note: ``state.json`` is written ONLY by the supervise loop. The
 ``dispatch`` CLI command never writes it — it writes ``workers/<s>/meta.json``
 plus append-only event/ledger lines, and the supervisor adopts the new worker
 on its next tick. This keeps two processes from racing on the snapshot.
+
+The single-writer invariant is ENFORCED, not just documented: the supervise
+loop holds an exclusive flock on ``<home>/supervisor.lock`` for its lifetime
+(see supervisor.py). A second supervisor against the same home fails loud —
+two loops would each re-emit queue/worker transitions (duplicate
+``packet:answered``/``worker:finished`` events + ledger lines) and race on
+state.json. flock dies with the process (even SIGKILL), so the D5
+kill/restart path needs no stale-lock handling.
 """
 
 from __future__ import annotations

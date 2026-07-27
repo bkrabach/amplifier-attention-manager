@@ -161,8 +161,29 @@ PY
     fi
     echo "  ONE batch notification covers both packets"
 
+    # Single-instance lock: a SECOND supervise against the same ATTENTION_HOME
+    # must fail loud (exit 1 + lock error) while the first one runs. This is
+    # the S4 DTU failure mode: a supervisor surviving a botched kill plus a
+    # restarted one silently duplicated packet:answered/worker:finished events.
+    local second_out=""
+    if second_out="$(am supervise --once --notify "file:$NOTIFY_FILE" 2>&1)"; then
+        echo "FAIL: second supervisor was allowed to run against the same home (single-instance lock broken)"
+        return 1
+    fi
+    if ! echo "$second_out" | grep -qi "another supervisor"; then
+        echo "FAIL: second supervise failed, but without the lock error (got: $second_out)"
+        return 1
+    fi
+    if [ "$(count_events "supervisor:started")" -ne 1 ]; then
+        echo "FAIL: refused supervisor still wrote events (supervisor:started count: $(count_events supervisor:started))"
+        return 1
+    fi
+    echo "  second supervisor refused loud (single-instance lock held; no events written)"
+
     # Kill the supervisor mid-run (packets created, not yet answered), restart,
-    # and prove state rebuild: no duplicate packet:created events (D5).
+    # and prove state rebuild: no duplicate packet:created events (D5). The
+    # restart also proves the lock is RELEASED on clean shutdown (and flock
+    # dies with the process on SIGKILL — see tests/test_supervisor_lock.py).
     kill "$SUP_PID" 2>/dev/null
     wait "$SUP_PID" 2>/dev/null
     SUP_PID=""

@@ -149,6 +149,7 @@ S4_ASSERTION_NAMES = [
     "two-decision-packets",
     "events-packet-created-x2",
     "all-created-packets-notified",
+    "supervisor-killed",
     "restart-no-duplicate-events",
     "packet-worker-mapping",
     "answers-accepted",
@@ -156,6 +157,7 @@ S4_ASSERTION_NAMES = [
     "w2-received-B",
     "events-packet-answered-x2-latency",
     "events-worker-finished-x2-judged-false",
+    "events-no-duplicates",
     "ledger-full-story",
 ]
 
@@ -299,17 +301,24 @@ def cmd_answer(cfg: Config, queue_dir: str, packet_id: str, option: str, rationa
 
 
 def cmd_launch_worker(cfg: Config, queue_dir: str, dtu_sdir: str, bundle_path: str, prompt: str) -> str:
-    """Background-launch a worker in its own process group; print its PID.
+    """Background-launch a worker in its own process group; record its PGID.
 
-    setsid puts the worker in a new session (PGID == PID) so scenario 3 can
-    SIGKILL the whole group. stdout+stderr -> worker.log; exit -> worker.exit.
+    setsid puts the worker in a new session (PGID == PID of the setsid'd bash)
+    so scenario 3 can SIGKILL the whole group. The PGID is written to
+    worker.pgid FROM INSIDE the new session (`echo $$`) — `$!` of the launch
+    line is the pid of the background *subshell* wrapping `mkdir && setsid`,
+    which is NOT the worker's process group (proven in the S4 incident: the
+    group kill missed the real process and it survived). stdout+stderr ->
+    worker.log; exit -> worker.exit.
     """
     log = f"{dtu_sdir}/worker.log"
     exit_file = f"{dtu_sdir}/worker.exit"
+    pgid_file = f"{dtu_sdir}/worker.pgid"
     # `amplifier run` rejects bare filesystem paths for -B — only registered
     # names or URIs (file://, git+https://) are accepted (verified in DTU).
     bundle_uri = bundle_path if "://" in bundle_path else f"file://{bundle_path}"
     inner = (
+        f"echo $$ > {shlex.quote(pgid_file)}; "
         f"{_env_prefix(queue_dir)} "
         f"amplifier run -B {shlex.quote(bundle_uri)}"
         + (f" {cfg.amplifier_args}" if cfg.amplifier_args else "")
@@ -329,6 +338,10 @@ def cmd_kill_group(pid: str) -> str:
     return f"kill -9 -- -{pid} 2>/dev/null; kill -9 {pid} 2>/dev/null; true"
 
 
+def cmd_read_pgid(pgid_file: str) -> str:
+    return f"cat {shlex.quote(pgid_file)} 2>/dev/null || true"
+
+
 def cmd_cat(path: str) -> str:
     return f"cat {shlex.quote(path)}"
 
@@ -344,16 +357,28 @@ def cmd_file_absent(path: str) -> str:
 # -- scenario-4 command builders (supervisor fleet) --------------------------------
 
 
-def cmd_supervise_launch(cfg: Config, queue_dir: str, home: str, dtu_sdir: str, notify_path: str, sup_log: str) -> str:
-    """Background-launch the supervisor in its own process group; print its PID.
+def cmd_supervise_launch(
+    cfg: Config, queue_dir: str, home: str, dtu_sdir: str, notify_path: str, sup_log: str, pgid_file: str
+) -> str:
+    """Background-launch the supervisor in its own process group; record its PGID.
 
     stdout+stderr APPEND to sup_log so the pre- and post-restart runs share one
     supervisor.log. ATTENTION_QUEUE_DIR + ATTENTION_HOME are exported (both
     supervise and dispatch need them).
+
+    KILL CORRECTNESS (S4 incident): `$!` of this launch line is the pid of the
+    background *subshell* wrapping `mkdir && setsid ...` — NOT the supervisor's
+    process group. Killing `-$!` missed the real supervisor, it survived, and
+    the restarted supervisor ran CONCURRENTLY with it (duplicate
+    packet:answered events). The truthful PGID is captured from inside the new
+    session: `echo $$` runs in the setsid'd bash (session/group leader), and
+    `exec` replaces that bash with the supervisor, so pgid_file == the
+    supervisor's own PID == its PGID, regardless of shell fork optimizations.
     """
     inner = (
+        f"echo $$ > {shlex.quote(pgid_file)}; "
         f"{_env_prefix(queue_dir, home)} "
-        f"{cfg.am_cli} supervise --interval {S4_TICK_INTERVAL_S:g} "
+        f"exec {cfg.am_cli} supervise --interval {S4_TICK_INTERVAL_S:g} "
         f"--notify {shlex.quote('file:' + notify_path)} "
         f"--batch-window {S4_BATCH_WINDOW_S:g} --batch-max {S4_BATCH_MAX} "
         f">> {shlex.quote(sup_log)} 2>&1"
@@ -442,6 +467,19 @@ class DtuExec:
 # -- scenario runtime --------------------------------------------------------------
 
 
+def _poll_pgid_file(ex: DtuExec, pgid_file: str, label: str, budget_s: float = 15.0) -> str | None:
+    """Read the pgid file written from inside the setsid'd session (poll: the
+    background launch races the reader). Returns the pgid string or None."""
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        result = ex.run(cmd_read_pgid(pgid_file), label=label)
+        pgid = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
+        if pgid.isdigit():
+            return pgid
+        time.sleep(0.5)
+    return None
+
+
 class Scenario:
     """Shared per-scenario runtime: paths, deadline, assertions, snapshots."""
 
@@ -492,12 +530,21 @@ class Scenario:
             cmd_launch_worker(self.cfg, self.queue_dir, self.dtu_sdir, bundle, prompt),
             label="launch-worker",
         )
-        pid = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
-        if result.rc != 0 or not pid.isdigit():
-            self.cne("worker-launched", f"launch rc={result.rc}, pid output {pid!r}, stderr={result.stderr.strip()!r}")
+        launcher_pid = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
+        if result.rc != 0 or not launcher_pid.isdigit():
+            self.cne(
+                "worker-launched",
+                f"launch rc={result.rc}, pid output {launcher_pid!r}, stderr={result.stderr.strip()!r}",
+            )
             return None
-        self.worker_pid = pid
-        return pid
+        # The worker's REAL process group id is written by the setsid'd bash
+        # itself (worker.pgid) — `$!` is only the wrapping subshell.
+        pgid = _poll_pgid_file(self.ex, f"{self.dtu_sdir}/worker.pgid", "worker-pgid-read")
+        if pgid is None:
+            self.cne("worker-launched", f"worker.pgid never appeared (launcher pid {launcher_pid})")
+            return None
+        self.worker_pid = pgid
+        return pgid
 
     def wait_for_packet(self, kind: str) -> dict[str, Any] | None:
         budget = min(PACKET_WAIT_S, max(0.0, self.remaining()))
@@ -812,6 +859,21 @@ def _events_named(events: list[dict[str, Any]], name: str) -> list[dict[str, Any
     return [e for e in events if e.get("event") == name]
 
 
+def _duplicate_packet_events(events: list[dict[str, Any]]) -> dict[str, int]:
+    """(event, packet_id) pairs seen more than once for the per-packet events.
+
+    A non-empty result is the direct signature of two supervisors writing the
+    same home concurrently (single-writer invariant violated).
+    """
+    counts: dict[str, int] = {}
+    for e in events:
+        name = str(e.get("event"))
+        if name in ("packet:created", "packet:answered"):
+            key = f"{name}:{e.get('packet_id')}"
+            counts[key] = counts.get(key, 0) + 1
+    return {key: n for key, n in counts.items() if n > 1}
+
+
 def _poll(s: Scenario, budget: float, fn: Any) -> Any:
     """Poll fn() every POLL_INTERVAL_S until non-None, budget, or scenario deadline."""
     deadline = time.monotonic() + min(budget, max(0.0, s.remaining()))
@@ -876,24 +938,31 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
     notify_path = f"{s.dtu_sdir}/notify.jsonl"
     sup_log = f"{s.dtu_sdir}/supervisor.log"
     bundle_uri = f"file://{cfg.repo_dir}/{spec.bundle_rel}"
+    sup_pgid_file = f"{s.dtu_sdir}/supervisor.pgid"
     sup_pids: list[str] = []
     try:
         # 0. Pre-clean fixed-name sessions (dispatch fails loud on an existing one).
         for w in S4_WORKERS.values():
             s.ex.run(cmd_tmux_kill(str(w["session"])), label=f"pre-kill-{w['session']}")
 
-        # 1. Supervisor up (background, own process group).
+        # 1. Supervisor up (background, own process group). The kill target is
+        #    the REAL pgid from supervisor.pgid (written inside the setsid'd
+        #    session) — `$!` is only the wrapping subshell (S4 incident).
         launch = s.ex.run(
-            cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log),
+            cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log, sup_pgid_file),
             label="supervise-launch",
         )
-        pid = launch.stdout.strip().splitlines()[-1].strip() if launch.stdout.strip() else ""
-        if launch.rc != 0 or not pid.isdigit():
-            s.cne("supervisor-started", f"launch rc={launch.rc}, pid output {pid!r}, stderr={launch.stderr.strip()!r}")
+        if launch.rc != 0:
+            s.cne("supervisor-started", f"launch rc={launch.rc}, stderr={launch.stderr.strip()!r}")
+            _cne_rest_s4(s, "supervisor never started")
+            return _finish(s, started)
+        pid = _poll_pgid_file(s.ex, sup_pgid_file, "supervisor-pgid-read")
+        if pid is None:
+            s.cne("supervisor-started", f"supervisor.pgid never appeared (launch stdout {launch.stdout.strip()!r})")
             _cne_rest_s4(s, "supervisor never started")
             return _finish(s, started)
         sup_pids.append(pid)
-        s.check("supervisor-started", True, f"supervisor pid {pid}")
+        s.check("supervisor-started", True, f"supervisor pgid {pid} (from supervisor.pgid)")
 
         # 2. Dispatch the fleet.
         dispatch_details: list[str] = []
@@ -1007,26 +1076,41 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
                 f"both ids notified across {len(batches)} well-formed batch record(s); {soft}",
             )
 
-        # 7. Durability: SIGKILL supervisor group, restart, ~2 ticks, no dupes.
+        # 7. Durability: SIGKILL supervisor group, VERIFY it is dead, restart,
+        #    ~2 ticks, no dupes. The dead-check is load-bearing: in the S4
+        #    incident the group kill missed the real supervisor, it survived,
+        #    and the "restart" silently ran TWO supervisors concurrently
+        #    (duplicate packet:answered events, corrupted single-writer state).
         s.ex.run(cmd_kill_group(pid), label="sigkill-supervisor")
-        relaunch = s.ex.run(
-            cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log),
-            label="supervise-relaunch",
+        time.sleep(1.0)
+        alive_probe = s.ex.run(cmd_worker_alive(pid), label="post-kill-supervisor-alive")
+        killed = alive_probe.stdout.strip() == "dead"
+        s.check(
+            "supervisor-killed", killed, f"post-SIGKILL probe of supervisor pgid {pid}: {alive_probe.stdout.strip()!r}"
         )
-        pid2 = relaunch.stdout.strip().splitlines()[-1].strip() if relaunch.stdout.strip() else ""
-        if relaunch.rc != 0 or not pid2.isdigit():
-            s.cne("restart-no-duplicate-events", f"supervisor relaunch failed: rc={relaunch.rc}, pid {pid2!r}")
-        else:
-            sup_pids.append(pid2)
-            time.sleep(min(S4_RESTART_SETTLE_S, max(0.0, s.remaining())))
-            events_after, malformed_after = _fetch_events(s, home)
-            created_after = _events_named(events_after, "packet:created")
-            s.check(
-                "restart-no-duplicate-events",
-                len(created_after) == 2,
-                f"packet:created count after SIGKILL+restart+~2 ticks: {len(created_after)} "
-                f"(restart pid {pid2}; malformed lines: {malformed_after})",
+        if not killed:
+            s.cne(
+                "restart-no-duplicate-events", "old supervisor survived the kill — restarting would run two supervisors"
             )
+        else:
+            relaunch = s.ex.run(
+                cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log, sup_pgid_file),
+                label="supervise-relaunch",
+            )
+            pid2 = _poll_pgid_file(s.ex, sup_pgid_file, "supervisor-pgid-read-2") if relaunch.rc == 0 else None
+            if pid2 is None or pid2 == pid:
+                s.cne("restart-no-duplicate-events", f"supervisor relaunch failed: rc={relaunch.rc}, pgid {pid2!r}")
+            else:
+                sup_pids.append(pid2)
+                time.sleep(min(S4_RESTART_SETTLE_S, max(0.0, s.remaining())))
+                events_after, malformed_after = _fetch_events(s, home)
+                created_after = _events_named(events_after, "packet:created")
+                s.check(
+                    "restart-no-duplicate-events",
+                    len(created_after) == 2,
+                    f"packet:created count after SIGKILL+restart+~2 ticks: {len(created_after)} "
+                    f"(restart pgid {pid2}; malformed lines: {malformed_after})",
+                )
 
         # 8. Map packets to workers (tag primary, keywords fallback).
         mapping = _map_packets_to_workers(packets)
@@ -1067,38 +1151,68 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
                 f"looked for {w['needle']!r} in {w['session']}/worker.log (ANSI-stripped, <= {S4_WORKER_WAIT_S:.0f}s)",
             )
 
-        # 12/13. Events: 2 packet:answered (latency_s) + 2 worker:finished (judged:false).
+        # 12/13. Events: 2 packet:answered (latency_s, covering BOTH packets) +
+        # 2 worker:finished (judged:false, covering BOTH sessions). The poll
+        # requires DISTINCT coverage, not raw counts — in the S4 incident,
+        # duplicate am-w1 finish events satisfied a count>=2 poll while am-w2's
+        # finish was still in flight, masking both defects.
+        expected_sessions = {str(w["session"]) for w in S4_WORKERS.values()}
+
         def poll_final_events() -> list[dict[str, Any]] | None:
             events, _ = _fetch_events(s, home)
-            if (
-                len(_events_named(events, "packet:answered")) >= 2
-                and len(_events_named(events, "worker:finished")) >= 2
-            ):
+            answered_ids = {str(e.get("packet_id")) for e in _events_named(events, "packet:answered")}
+            finished_sessions = {str(e.get("session")) for e in _events_named(events, "worker:finished")}
+            if answered_ids >= set(packet_ids) and finished_sessions >= expected_sessions:
                 return events
             return None
 
         final_events = _poll(s, S4_EVENTS_WAIT_S, poll_final_events)
         if final_events is None:
-            events_now, _ = _fetch_events(s, home)
-            n_ans = len(_events_named(events_now, "packet:answered"))
-            n_fin = len(_events_named(events_now, "worker:finished"))
-            s.check("events-packet-answered-x2-latency", False, f"only {n_ans} packet:answered within budget")
-            s.check("events-worker-finished-x2-judged-false", False, f"only {n_fin} worker:finished within budget")
+            final_events, _ = _fetch_events(s, home)
+            answered_events = _events_named(final_events, "packet:answered")
+            finished_events = _events_named(final_events, "worker:finished")
+            s.check(
+                "events-packet-answered-x2-latency",
+                False,
+                f"within budget only {len(answered_events)} packet:answered "
+                f"(ids={sorted({str(e.get('packet_id')) for e in answered_events})}, need both of {packet_ids})",
+            )
+            s.check(
+                "events-worker-finished-x2-judged-false",
+                False,
+                f"within budget only {len(finished_events)} worker:finished "
+                f"(sessions={sorted({str(e.get('session')) for e in finished_events})}, "
+                f"need both of {sorted(expected_sessions)})",
+            )
         else:
             answered_events = _events_named(final_events, "packet:answered")
             s.check(
                 "events-packet-answered-x2-latency",
-                len(answered_events) == 2 and all(e.get("latency_s") is not None for e in answered_events),
-                f"count={len(answered_events)}, latencies={[e.get('latency_s') for e in answered_events]}",
+                len(answered_events) == 2
+                and {str(e.get("packet_id")) for e in answered_events} == set(packet_ids)
+                and all(e.get("latency_s") is not None for e in answered_events),
+                f"count={len(answered_events)}, ids={sorted(str(e.get('packet_id')) for e in answered_events)}, "
+                f"latencies={[e.get('latency_s') for e in answered_events]}",
             )
             finished_events = _events_named(final_events, "worker:finished")
             s.check(
                 "events-worker-finished-x2-judged-false",
                 len(finished_events) == 2
+                and {str(e.get("session")) for e in finished_events} == expected_sessions
                 and all(e.get("judged") is False and e.get("exit_code") == 0 for e in finished_events),
                 f"count={len(finished_events)}, "
                 f"details={[{k: e.get(k) for k in ('session', 'exit_code', 'judged')} for e in finished_events]}",
             )
+
+        # 13b. No duplicate (event, packet_id) pairs — the direct signature of
+        # two supervisors writing the same home (S4 incident: each packet got
+        # TWO identical packet:answered events).
+        dupes = _duplicate_packet_events(final_events)
+        s.check(
+            "events-no-duplicates",
+            not dupes,
+            f"duplicate (event, packet_id) pairs: {dupes}" if dupes else "no duplicate packet:created/packet:answered",
+        )
 
         # 14. Ledger tells the full story.
         ledger_result = s.ex.run(cmd_ledger_cat(home), label="ledger-fetch")
@@ -1162,12 +1276,15 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     steps: list[tuple[str, str]] = []
     for w in S4_WORKERS.values():
         steps.append((f"pre-clean leftover {w['session']} session (best-effort)", cmd_tmux_kill(str(w["session"]))))
+    sup_pgid_file = f"{dtu_sdir}/supervisor.pgid"
     steps.append(
         (
-            "start supervisor in background (own process group; stdout+stderr APPEND to supervisor.log; prints PID)",
-            cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log),
+            "start supervisor in background (own process group; stdout+stderr APPEND to supervisor.log; "
+            "the setsid'd session writes its REAL pgid to supervisor.pgid — `$!` is only the wrapping subshell)",
+            cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log, sup_pgid_file),
         )
     )
+    steps.append(("read the supervisor's real pgid (poll until non-empty)", cmd_read_pgid(sup_pgid_file)))
     for name, w in S4_WORKERS.items():
         steps.append(
             (
@@ -1191,10 +1308,15 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
             "batch records (soft detail: ONE batch covering both)",
             cmd_cat(notify_path),
         ),
-        ("SIGKILL the supervisor process group mid-run", cmd_kill_group(sup_pid)),
+        ("SIGKILL the supervisor process group mid-run (pgid from supervisor.pgid)", cmd_kill_group(sup_pid)),
         (
-            "restart supervisor with the same flags",
-            cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log),
+            "VERIFY the supervisor is dead (a surviving one would run concurrently with the restart "
+            "and duplicate events — hard FAIL)",
+            cmd_worker_alive(sup_pid),
+        ),
+        (
+            "restart supervisor with the same flags (new pgid written to supervisor.pgid)",
+            cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log, sup_pgid_file),
         ),
         (
             f"wait ~2 ticks ({S4_RESTART_SETTLE_S:.0f}s), then assert packet:created count is STILL exactly 2 (D5)",
