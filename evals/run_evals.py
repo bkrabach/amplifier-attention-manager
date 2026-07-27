@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""attention-manager evaluation harness (build step 1).
+"""attention-manager evaluation harness (build steps 1 + 2).
 
-Runs the three scenarios in evals/scenarios/ INSIDE an already-running DTU
+Runs the scenarios in evals/scenarios/ INSIDE an already-running DTU
 (or any environment reachable via an exec command prefix):
 
     python evals/run_evals.py \\
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -84,7 +85,88 @@ S3_PROMPT = (
     "policy you will use per the answer. Then you are done."
 )
 
+# -- scenario 4 (supervised fleet) constants ----------------------------------
+
+S4_TIMEOUT_S = 600.0  # two parallel LLM workers + batch window + restart
+S4_TICK_INTERVAL_S = 2.0  # supervise --interval
+S4_BATCH_WINDOW_S = 30.0  # supervise --batch-window
+S4_BATCH_MAX = 10  # supervise --batch-max
+S4_NOTIFY_WAIT_S = 120.0  # budget for batch notification(s) after both packets
+S4_EVENTS_WAIT_S = 90.0  # budget for event counts to catch up (ticks every 2s)
+S4_WORKER_WAIT_S = 180.0  # budget for DECISION RECEIVED in worker logs
+S4_RESTART_SETTLE_S = 6.0  # ~2 ticks + margin after supervisor restart
+
+S4_W1_PROMPT = (
+    "This task contains a NEEDS-HUMAN-DECISION point.\n\n"
+    "NEEDS-HUMAN-DECISION [w1]: Should the config file format be JSON or YAML?\n"
+    "Options:\n"
+    "- A: use JSON (consequence: stricter syntax, no comments)\n"
+    "- B: use YAML (consequence: human-friendlier, extra parser dependency)\n\n"
+    "Call the request_decision tool with exactly these two options (ids A and B).\n"
+    "Include the literal tag [w1] at the start of the question you pass to the tool.\n"
+    "Include your recommendation with a one-line rationale and confidence, and wait\n"
+    "for the answer. Then print exactly `DECISION RECEIVED: <answer>` and state which\n"
+    "format you will use per the answer. Then you are done."
+)
+
+S4_W2_PROMPT = (
+    "This task contains a NEEDS-HUMAN-DECISION point.\n\n"
+    "NEEDS-HUMAN-DECISION [w2]: Should the cache eviction policy be LRU or FIFO?\n"
+    "Options:\n"
+    "- A: use LRU (consequence: better hit rate, more bookkeeping)\n"
+    "- B: use FIFO (consequence: simpler, worse hit rate under skew)\n\n"
+    "Call the request_decision tool with exactly these two options (ids A and B).\n"
+    "Include the literal tag [w2] at the start of the question you pass to the tool.\n"
+    "Include your recommendation with a one-line rationale and confidence, and wait\n"
+    "for the answer. Then print exactly `DECISION RECEIVED: <answer>` and state which\n"
+    "policy you will use per the answer. Then you are done."
+)
+
+# Worker names are FIXED by the flow contract (tmux sessions am-w1 / am-w2).
+S4_WORKERS: dict[str, dict[str, Any]] = {
+    "w1": {
+        "session": "am-w1",
+        "prompt": S4_W1_PROMPT,
+        "tag": "[w1]",
+        "keywords": ("json", "yaml", "config file format"),
+        "answer": "A",
+        "needle": "DECISION RECEIVED: A",
+    },
+    "w2": {
+        "session": "am-w2",
+        "prompt": S4_W2_PROMPT,
+        "tag": "[w2]",
+        "keywords": ("lru", "fifo", "eviction"),
+        "answer": "B",
+        "needle": "DECISION RECEIVED: B",
+    },
+}
+
+S4_ASSERTION_NAMES = [
+    "supervisor-started",
+    "workers-dispatched",
+    "tmux-sessions-exist",
+    "two-decision-packets",
+    "events-packet-created-x2",
+    "all-created-packets-notified",
+    "restart-no-duplicate-events",
+    "packet-worker-mapping",
+    "answers-accepted",
+    "w1-received-A",
+    "w2-received-B",
+    "events-packet-answered-x2-latency",
+    "events-worker-finished-x2-judged-false",
+    "ledger-full-story",
+]
+
 CNE = "could-not-evaluate"
+
+# CSI + OSC ANSI escape sequences (tmux pipe-pane logs carry terminal control codes).
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 # -- data ------------------------------------------------------------------------
@@ -147,6 +229,7 @@ class ScenarioSpec:
     prompt: str
     bundle_rel: str  # bundle path relative to repo_dir
     answer_option: str
+    timeout_s: float = SCENARIO_TIMEOUT_S  # per-scenario hard deadline
 
 
 SPECS = {
@@ -177,14 +260,27 @@ SPECS = {
         bundle_rel="bundles/test-worker.md",
         answer_option="B",
     ),
+    4: ScenarioSpec(
+        number=4,
+        slug="s4-supervised-fleet",
+        title="Scenario 4 — supervised fleet roundtrip (step 2)",
+        kind="decision",
+        prompt="",  # two per-worker prompts; see S4_WORKERS
+        bundle_rel="bundles/test-worker.md",
+        answer_option="",  # per-worker answers; see S4_WORKERS
+        timeout_s=S4_TIMEOUT_S,
+    ),
 }
 
 
 # -- in-DTU command builders (shared by executor and --dry-run planner) -----------
 
 
-def _env_prefix(queue_dir: str) -> str:
-    return f"export ATTENTION_QUEUE_DIR={shlex.quote(queue_dir)};"
+def _env_prefix(queue_dir: str, home: str | None = None) -> str:
+    parts = [f"export ATTENTION_QUEUE_DIR={shlex.quote(queue_dir)};"]
+    if home:
+        parts.append(f"export ATTENTION_HOME={shlex.quote(home)};")
+    return " ".join(parts)
 
 
 def cmd_queue_list(cfg: Config, queue_dir: str) -> str:
@@ -243,6 +339,54 @@ def cmd_file_exists(path: str) -> str:
 
 def cmd_file_absent(path: str) -> str:
     return f"test ! -f {shlex.quote(path)} && echo absent || echo present"
+
+
+# -- scenario-4 command builders (supervisor fleet) --------------------------------
+
+
+def cmd_supervise_launch(cfg: Config, queue_dir: str, home: str, dtu_sdir: str, notify_path: str, sup_log: str) -> str:
+    """Background-launch the supervisor in its own process group; print its PID.
+
+    stdout+stderr APPEND to sup_log so the pre- and post-restart runs share one
+    supervisor.log. ATTENTION_QUEUE_DIR + ATTENTION_HOME are exported (both
+    supervise and dispatch need them).
+    """
+    inner = (
+        f"{_env_prefix(queue_dir, home)} "
+        f"{cfg.am_cli} supervise --interval {S4_TICK_INTERVAL_S:g} "
+        f"--notify {shlex.quote('file:' + notify_path)} "
+        f"--batch-window {S4_BATCH_WINDOW_S:g} --batch-max {S4_BATCH_MAX} "
+        f">> {shlex.quote(sup_log)} 2>&1"
+    )
+    return (
+        f"mkdir -p {shlex.quote(queue_dir)} {shlex.quote(home)} {shlex.quote(dtu_sdir)} && "
+        f"setsid bash -c {shlex.quote(inner)} < /dev/null > /dev/null 2>&1 & echo $!"
+    )
+
+
+def cmd_dispatch(cfg: Config, queue_dir: str, home: str, name: str, task: str, bundle_uri: str) -> str:
+    """Dispatch a worker into an am-<name> tmux session (env exported so the
+    dispatch CLI forwards ATTENTION_QUEUE_DIR/ATTENTION_HOME into the pane)."""
+    return (
+        f"{_env_prefix(queue_dir, home)} {cfg.am_cli} dispatch {shlex.quote(name)} "
+        f"--task {shlex.quote(task)} --bundle {shlex.quote(bundle_uri)}"
+    )
+
+
+def cmd_tmux_has(session: str) -> str:
+    return f"tmux has-session -t ={session} 2>/dev/null && echo yes || echo no"
+
+
+def cmd_tmux_ls() -> str:
+    return "tmux ls 2>/dev/null || true"
+
+
+def cmd_tmux_kill(session: str) -> str:
+    return f"tmux kill-session -t ={session} 2>/dev/null; true"
+
+
+def cmd_ledger_cat(home: str) -> str:
+    return f"cat {shlex.quote(home)}/ledger/*.jsonl 2>/dev/null || true"
 
 
 # -- exec layer --------------------------------------------------------------------
@@ -308,7 +452,7 @@ class Scenario:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.dtu_sdir = f"{cfg.work_dir}/{cfg.run_id}/{spec.slug}"
         self.queue_dir = f"{self.dtu_sdir}/queue"
-        self.deadline = time.monotonic() + SCENARIO_TIMEOUT_S
+        self.deadline = time.monotonic() + spec.timeout_s
         self.assertions: list[Assertion] = []
         self.snapshots = self.out_dir / "queue_snapshots.jsonl"
         assert cfg.dtu_exec is not None
@@ -634,6 +778,351 @@ def run_scenario_3(cfg: Config) -> ScenarioResult:
         s.cleanup()
 
 
+# -- scenario 4: supervised fleet roundtrip (step 2) --------------------------------
+
+
+def _parse_jsonl(text: str) -> tuple[list[dict[str, Any]], int]:
+    """Parse JSONL leniently; return (records, malformed_line_count)."""
+    records: list[dict[str, Any]] = []
+    malformed = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+        else:
+            malformed += 1
+    return records, malformed
+
+
+def _fetch_events(s: Scenario, home: str) -> tuple[list[dict[str, Any]], int]:
+    result = s.ex.run(cmd_cat(f"{home}/events.jsonl"), label="events-fetch")
+    if result.rc != 0:
+        return [], 0
+    return _parse_jsonl(result.stdout)
+
+
+def _events_named(events: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    return [e for e in events if e.get("event") == name]
+
+
+def _poll(s: Scenario, budget: float, fn: Any) -> Any:
+    """Poll fn() every POLL_INTERVAL_S until non-None, budget, or scenario deadline."""
+    deadline = time.monotonic() + min(budget, max(0.0, s.remaining()))
+    while time.monotonic() < deadline:
+        value = fn()
+        if value is not None:
+            return value
+        time.sleep(POLL_INTERVAL_S)
+    return None
+
+
+def _map_packets_to_workers(packets: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
+    """Map each packet to exactly one worker via tag (primary) / keywords (fallback).
+
+    Returns {"w1": packet, "w2": packet} or None when ambiguous/incomplete.
+    """
+    mapping: dict[str, dict[str, Any]] = {}
+    for packet in packets:
+        question = str(packet.get("question", "")).lower()
+        hits = [
+            name for name, w in S4_WORKERS.items() if w["tag"] in question or any(k in question for k in w["keywords"])
+        ]
+        if len(hits) != 1 or hits[0] in mapping:
+            return None
+        mapping[hits[0]] = packet
+    return mapping if set(mapping) == set(S4_WORKERS) else None
+
+
+def _cne_rest_s4(s: Scenario, reason: str) -> None:
+    """FAIL every not-yet-recorded S4 assertion as could-not-evaluate."""
+    recorded = {a.name for a in s.assertions}
+    for name in S4_ASSERTION_NAMES:
+        if name not in recorded:
+            s.cne(name, reason)
+
+
+def _collect_s4_artifacts(s: Scenario, home: str, notify_path: str, sup_log: str) -> None:
+    """Best-effort artifact collection — runs even when the scenario bails early."""
+    artifacts = [
+        ("supervisor-log", cmd_cat(sup_log), "supervisor.log"),
+        ("events-copy", cmd_cat(f"{home}/events.jsonl"), "events.jsonl"),
+        ("ledger-copy", cmd_ledger_cat(home), "ledger.jsonl"),
+        ("notify-copy", cmd_cat(notify_path), "notify.jsonl"),
+        ("tmux-ls", cmd_tmux_ls(), "tmux-ls.txt"),
+        ("w1-log", cmd_cat(f"{home}/workers/am-w1/worker.log"), "worker-am-w1.log"),
+        ("w2-log", cmd_cat(f"{home}/workers/am-w2/worker.log"), "worker-am-w2.log"),
+    ]
+    for label, cmd, filename in artifacts:
+        try:
+            result = s.ex.run(cmd, label=f"artifact-{label}")
+            if result.rc == 0:
+                (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
+        except Exception as e:  # artifact collection must never mask the verdict
+            print(f"    (artifact {label} not collected: {e})")
+
+
+def run_scenario_4(cfg: Config) -> ScenarioResult:
+    spec = SPECS[4]
+    s = Scenario(cfg, spec)
+    started = time.monotonic()
+    home = f"{s.dtu_sdir}/home"
+    notify_path = f"{s.dtu_sdir}/notify.jsonl"
+    sup_log = f"{s.dtu_sdir}/supervisor.log"
+    bundle_uri = f"file://{cfg.repo_dir}/{spec.bundle_rel}"
+    sup_pids: list[str] = []
+    try:
+        # 0. Pre-clean fixed-name sessions (dispatch fails loud on an existing one).
+        for w in S4_WORKERS.values():
+            s.ex.run(cmd_tmux_kill(str(w["session"])), label=f"pre-kill-{w['session']}")
+
+        # 1. Supervisor up (background, own process group).
+        launch = s.ex.run(
+            cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log),
+            label="supervise-launch",
+        )
+        pid = launch.stdout.strip().splitlines()[-1].strip() if launch.stdout.strip() else ""
+        if launch.rc != 0 or not pid.isdigit():
+            s.cne("supervisor-started", f"launch rc={launch.rc}, pid output {pid!r}, stderr={launch.stderr.strip()!r}")
+            _cne_rest_s4(s, "supervisor never started")
+            return _finish(s, started)
+        sup_pids.append(pid)
+        s.check("supervisor-started", True, f"supervisor pid {pid}")
+
+        # 2. Dispatch the fleet.
+        dispatch_details: list[str] = []
+        dispatch_ok = True
+        for name, w in S4_WORKERS.items():
+            result = s.ex.run(
+                cmd_dispatch(cfg, s.queue_dir, home, name, str(w["prompt"]), bundle_uri),
+                label=f"dispatch-{name}",
+            )
+            dispatch_details.append(
+                f"{name}: rc={result.rc}" + (f" stderr={result.stderr.strip()!r}" if result.rc else "")
+            )
+            dispatch_ok = dispatch_ok and result.rc == 0
+        s.check("workers-dispatched", dispatch_ok, "; ".join(dispatch_details))
+        if not dispatch_ok:
+            _cne_rest_s4(s, "dispatch failed")
+            return _finish(s, started)
+
+        # 3. Both tmux sessions exist.
+        session_states = {
+            str(w["session"]): s.ex.run(
+                cmd_tmux_has(str(w["session"])), label=f"tmux-has-{w['session']}"
+            ).stdout.strip()
+            for w in S4_WORKERS.values()
+        }
+        s.check(
+            "tmux-sessions-exist",
+            all(state == "yes" for state in session_states.values()),
+            f"{session_states}",
+        )
+
+        # 4. Two decision packets (real LLM workers — generous budget).
+        def poll_two_packets() -> list[dict[str, Any]] | None:
+            result = s.ex.run(cmd_queue_list(cfg, s.queue_dir), label="queue-list-poll")
+            s.snapshot("queue-list-poll", result)
+            if result.rc != 0:
+                return None
+            try:
+                listed = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return None
+            decisions = [p for p in listed if isinstance(p, dict) and (p.get("source") or {}).get("kind") == spec.kind]
+            return decisions if len(decisions) >= 2 else None
+
+        packets = _poll(s, PACKET_WAIT_S, poll_two_packets)
+        if packets is None:
+            s.cne("two-decision-packets", f"fewer than 2 kind={spec.kind} packets within {PACKET_WAIT_S:.0f}s")
+            _cne_rest_s4(s, "packets never appeared")
+            return _finish(s, started)
+        packet_ids = sorted(str(p.get("id", "")) for p in packets)
+        s.check("two-decision-packets", len(packets) == 2, f"count={len(packets)}, ids={packet_ids}")
+        (s.out_dir / "packet-pending.json").write_text(json.dumps(packets, indent=2), encoding="utf-8")
+
+        # 5. Exactly 2 packet:created events.
+        def poll_created() -> list[dict[str, Any]] | None:
+            events, _ = _fetch_events(s, home)
+            created = _events_named(events, "packet:created")
+            return created if len(created) >= 2 else None
+
+        created = _poll(s, S4_EVENTS_WAIT_S, poll_created)
+        if created is None:
+            events_now, malformed = _fetch_events(s, home)
+            s.check(
+                "events-packet-created-x2",
+                False,
+                f"expected 2 packet:created, saw {len(_events_named(events_now, 'packet:created'))} "
+                f"(malformed lines: {malformed})",
+            )
+        else:
+            s.check(
+                "events-packet-created-x2",
+                len(created) == 2,
+                f"count={len(created)}, packet_ids={sorted(str(e.get('packet_id')) for e in created)}",
+            )
+
+        # 6. Notifications: HARD = every created packet id appears in well-formed
+        #    batch records. SOFT (detail only) = ONE batch covered both.
+        def poll_notify() -> tuple[list[dict[str, Any]], int] | None:
+            result = s.ex.run(cmd_cat(notify_path), label="notify-fetch")
+            if result.rc != 0:
+                return None
+            batches, bad = _parse_jsonl(result.stdout)
+            shaped = [b for b in batches if "count" in b and isinstance(b.get("packets"), list)]
+            notified_ids = {str(p.get("id")) for b in shaped for p in b["packets"]}
+            if bad == 0 and len(shaped) == len(batches) and set(packet_ids) <= notified_ids:
+                return batches, bad
+            return None
+
+        notify_result = _poll(s, S4_NOTIFY_WAIT_S, poll_notify)
+        if notify_result is None:
+            sink_raw = s.ex.run(cmd_cat(notify_path), label="notify-final-fetch")
+            s.check(
+                "all-created-packets-notified",
+                False,
+                f"created ids {packet_ids} not fully covered by well-formed batch records within "
+                f"{S4_NOTIFY_WAIT_S:.0f}s; sink content: {sink_raw.stdout.strip()[:500]!r}",
+            )
+        else:
+            batches, _ = notify_result
+            covered_by_one = any(set(packet_ids) <= {str(p.get("id")) for p in b["packets"]} for b in batches)
+            single = len(batches) == 1 and covered_by_one
+            soft = (
+                "single-batch=yes"
+                if single
+                else f"single-batch=no ({len(batches)} batches — packets arrived >window apart; "
+                "acceptable: every packet was batch-notified)"
+            )
+            s.check(
+                "all-created-packets-notified",
+                True,
+                f"both ids notified across {len(batches)} well-formed batch record(s); {soft}",
+            )
+
+        # 7. Durability: SIGKILL supervisor group, restart, ~2 ticks, no dupes.
+        s.ex.run(cmd_kill_group(pid), label="sigkill-supervisor")
+        relaunch = s.ex.run(
+            cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log),
+            label="supervise-relaunch",
+        )
+        pid2 = relaunch.stdout.strip().splitlines()[-1].strip() if relaunch.stdout.strip() else ""
+        if relaunch.rc != 0 or not pid2.isdigit():
+            s.cne("restart-no-duplicate-events", f"supervisor relaunch failed: rc={relaunch.rc}, pid {pid2!r}")
+        else:
+            sup_pids.append(pid2)
+            time.sleep(min(S4_RESTART_SETTLE_S, max(0.0, s.remaining())))
+            events_after, malformed_after = _fetch_events(s, home)
+            created_after = _events_named(events_after, "packet:created")
+            s.check(
+                "restart-no-duplicate-events",
+                len(created_after) == 2,
+                f"packet:created count after SIGKILL+restart+~2 ticks: {len(created_after)} "
+                f"(restart pid {pid2}; malformed lines: {malformed_after})",
+            )
+
+        # 8. Map packets to workers (tag primary, keywords fallback).
+        mapping = _map_packets_to_workers(packets)
+        if mapping is None:
+            questions = {str(p.get("id")): str(p.get("question", ""))[:80] for p in packets}
+            s.cne("packet-worker-mapping", f"ambiguous/incomplete tag+keyword mapping; questions={questions}")
+            _cne_rest_s4(s, "cannot answer without a packet->worker mapping")
+            return _finish(s, started)
+        mapping_detail = {name: str(pkt.get("id")) for name, pkt in mapping.items()}
+        s.check("packet-worker-mapping", True, f"{mapping_detail}")
+
+        # 9. Answer both (w1->A, w2->B).
+        answer_details: list[str] = []
+        answers_ok = True
+        for name, w in S4_WORKERS.items():
+            pkt_id = str(mapping[name].get("id"))
+            result = s.answer(pkt_id, str(w["answer"]))
+            answer_details.append(f"{name}: {pkt_id} -> {w['answer']} rc={result.rc}")
+            answers_ok = answers_ok and result.rc == 0
+        s.check("answers-accepted", answers_ok, "; ".join(answer_details))
+
+        # 10/11. Worker logs contain DECISION RECEIVED (poll both together).
+        found = dict.fromkeys(S4_WORKERS, False)
+        log_deadline = time.monotonic() + min(S4_WORKER_WAIT_S, max(0.0, s.remaining()))
+        while time.monotonic() < log_deadline and not all(found.values()):
+            for name, w in S4_WORKERS.items():
+                if found[name]:
+                    continue
+                result = s.ex.run(cmd_cat(f"{home}/workers/{w['session']}/worker.log"), label=f"worker-log-{name}")
+                if result.rc == 0 and str(w["needle"]) in _strip_ansi(result.stdout):
+                    found[name] = True
+            if not all(found.values()):
+                time.sleep(POLL_INTERVAL_S)
+        for name, w in S4_WORKERS.items():
+            s.check(
+                f"{name}-received-{w['answer']}",
+                found[name],
+                f"looked for {w['needle']!r} in {w['session']}/worker.log (ANSI-stripped, <= {S4_WORKER_WAIT_S:.0f}s)",
+            )
+
+        # 12/13. Events: 2 packet:answered (latency_s) + 2 worker:finished (judged:false).
+        def poll_final_events() -> list[dict[str, Any]] | None:
+            events, _ = _fetch_events(s, home)
+            if (
+                len(_events_named(events, "packet:answered")) >= 2
+                and len(_events_named(events, "worker:finished")) >= 2
+            ):
+                return events
+            return None
+
+        final_events = _poll(s, S4_EVENTS_WAIT_S, poll_final_events)
+        if final_events is None:
+            events_now, _ = _fetch_events(s, home)
+            n_ans = len(_events_named(events_now, "packet:answered"))
+            n_fin = len(_events_named(events_now, "worker:finished"))
+            s.check("events-packet-answered-x2-latency", False, f"only {n_ans} packet:answered within budget")
+            s.check("events-worker-finished-x2-judged-false", False, f"only {n_fin} worker:finished within budget")
+        else:
+            answered_events = _events_named(final_events, "packet:answered")
+            s.check(
+                "events-packet-answered-x2-latency",
+                len(answered_events) == 2 and all(e.get("latency_s") is not None for e in answered_events),
+                f"count={len(answered_events)}, latencies={[e.get('latency_s') for e in answered_events]}",
+            )
+            finished_events = _events_named(final_events, "worker:finished")
+            s.check(
+                "events-worker-finished-x2-judged-false",
+                len(finished_events) == 2
+                and all(e.get("judged") is False and e.get("exit_code") == 0 for e in finished_events),
+                f"count={len(finished_events)}, "
+                f"details={[{k: e.get(k) for k in ('session', 'exit_code', 'judged')} for e in finished_events]}",
+            )
+
+        # 14. Ledger tells the full story.
+        ledger_result = s.ex.run(cmd_ledger_cat(home), label="ledger-fetch")
+        ledger_records, ledger_malformed = _parse_jsonl(ledger_result.stdout)
+        kinds: dict[str, int] = {}
+        for record in ledger_records:
+            kind = str(record.get("kind"))
+            kinds[kind] = kinds.get(kind, 0) + 1
+        expected = {"dispatched": 2, "packet_created": 2, "packet_answered": 2, "worker_finished": 2}
+        mismatches = {k: (kinds.get(k, 0), v) for k, v in expected.items() if kinds.get(k, 0) != v}
+        s.check(
+            "ledger-full-story",
+            not mismatches and kinds.get("notified_batch", 0) >= 1 and ledger_malformed == 0,
+            f"kinds={kinds}, mismatches={mismatches or 'none'}, malformed_lines={ledger_malformed}",
+        )
+        return _finish(s, started)
+    finally:
+        _collect_s4_artifacts(s, home, notify_path, sup_log)
+        for sup_pid in sup_pids:
+            s.ex.run(cmd_kill_group(sup_pid), label="cleanup-kill-supervisor")
+        for w in S4_WORKERS.values():
+            s.ex.run(cmd_tmux_kill(str(w["session"])), label=f"cleanup-kill-{w['session']}")
+
+
 def _grade_decision_schema(show: ExecResult) -> tuple[bool, str]:
     if show.rc != 0:
         return False, f"queue show rc={show.rc} stderr={show.stderr.strip()!r}"
@@ -658,10 +1147,85 @@ def _finish(s: Scenario, started: float) -> ScenarioResult:
     return result
 
 
-RUNNERS = {1: run_scenario_1, 2: run_scenario_2, 3: run_scenario_3}
+RUNNERS = {1: run_scenario_1, 2: run_scenario_2, 3: run_scenario_3, 4: run_scenario_4}
 
 
 # -- dry-run planner --------------------------------------------------------------------
+
+
+def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[str, str]]:
+    home = f"{dtu_sdir}/home"
+    notify_path = f"{dtu_sdir}/notify.jsonl"
+    sup_log = f"{dtu_sdir}/supervisor.log"
+    bundle_uri = f"file://{cfg.repo_dir}/{SPECS[4].bundle_rel}"
+    pkt_w1, pkt_w2, sup_pid = "<W1_PACKET_ID>", "<W2_PACKET_ID>", "<SUP_PID>"
+    steps: list[tuple[str, str]] = []
+    for w in S4_WORKERS.values():
+        steps.append((f"pre-clean leftover {w['session']} session (best-effort)", cmd_tmux_kill(str(w["session"]))))
+    steps.append(
+        (
+            "start supervisor in background (own process group; stdout+stderr APPEND to supervisor.log; prints PID)",
+            cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log),
+        )
+    )
+    for name, w in S4_WORKERS.items():
+        steps.append(
+            (
+                f"dispatch worker {name} into tmux session {w['session']}",
+                cmd_dispatch(cfg, queue_dir, home, name, str(w["prompt"]), bundle_uri),
+            )
+        )
+    for w in S4_WORKERS.values():
+        steps.append((f"assert tmux session {w['session']} exists", cmd_tmux_has(str(w["session"]))))
+    steps += [
+        (
+            f"poll every {POLL_INTERVAL_S:.0f}s (<= {PACKET_WAIT_S:.0f}s) until exactly 2 kind=decision packets appear",
+            cmd_queue_list(cfg, queue_dir),
+        ),
+        (
+            "poll events.jsonl until exactly 2 packet:created events",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        (
+            f"poll notify sink (<= {S4_NOTIFY_WAIT_S:.0f}s): every created packet id covered by well-formed "
+            "batch records (soft detail: ONE batch covering both)",
+            cmd_cat(notify_path),
+        ),
+        ("SIGKILL the supervisor process group mid-run", cmd_kill_group(sup_pid)),
+        (
+            "restart supervisor with the same flags",
+            cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log),
+        ),
+        (
+            f"wait ~2 ticks ({S4_RESTART_SETTLE_S:.0f}s), then assert packet:created count is STILL exactly 2 (D5)",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        (
+            "map packets to workers via [w1]/[w2] tags (keyword fallback), then answer w1 -> A",
+            cmd_answer(cfg, queue_dir, pkt_w1, "A", "eval"),
+        ),
+        ("answer w2 -> B", cmd_answer(cfg, queue_dir, pkt_w2, "B", "eval")),
+        (
+            f"poll (<= {S4_WORKER_WAIT_S:.0f}s) am-w1 worker.log for 'DECISION RECEIVED: A' (ANSI-stripped)",
+            cmd_cat(f"{home}/workers/am-w1/worker.log"),
+        ),
+        (
+            f"poll (<= {S4_WORKER_WAIT_S:.0f}s) am-w2 worker.log for 'DECISION RECEIVED: B' (ANSI-stripped)",
+            cmd_cat(f"{home}/workers/am-w2/worker.log"),
+        ),
+        (
+            "poll events for 2 packet:answered (non-null latency_s) + 2 worker:finished (judged:false, exit_code 0)",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        (
+            "verify ledger: dispatched x2, packet_created x2, packet_answered x2, worker_finished x2, notified_batch >=1",
+            cmd_ledger_cat(home),
+        ),
+        ("cleanup: kill supervisor process group(s)", cmd_kill_group(sup_pid)),
+    ]
+    for w in S4_WORKERS.values():
+        steps.append((f"cleanup: kill tmux session {w['session']}", cmd_tmux_kill(str(w["session"]))))
+    return steps
 
 
 def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
@@ -669,6 +1233,8 @@ def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
     queue_dir = f"{dtu_sdir}/queue"
     bundle = f"{cfg.repo_dir}/{spec.bundle_rel}"
     pkt, pid = "<PACKET_ID>", "<PID>"
+    if spec.number == 4:
+        return _plan_scenario_4(cfg, dtu_sdir, queue_dir)
     steps: list[tuple[str, str]] = [
         (
             "launch worker in background (own process group; stdout+stderr -> worker.log; "
@@ -726,10 +1292,10 @@ def print_dry_run(cfg: Config, scenario_numbers: list[int]) -> None:
     print("DRY RUN — planned in-DTU command sequences (no DTU contacted).")
     print(f"Every command below is dispatched as: {prefix} -- bash -c '<command>'")
     print(f"run id: {cfg.run_id} | repo dir: {cfg.repo_dir} | am CLI: {cfg.am_cli!r}")
-    print(f"per-scenario hard timeout: {SCENARIO_TIMEOUT_S:.0f}s | packet wait: {PACKET_WAIT_S:.0f}s\n")
+    print(f"packet wait budget: {PACKET_WAIT_S:.0f}s\n")
     for n in scenario_numbers:
         spec = SPECS[n]
-        print(f"=== {spec.title} ({spec.slug}) ===")
+        print(f"=== {spec.title} ({spec.slug}) [hard timeout: {spec.timeout_s:.0f}s] ===")
         for i, (desc, cmd) in enumerate(plan_scenario(cfg, spec), 1):
             print(f"  {i}. {desc}")
             print(f"     $ {cmd}")
@@ -780,7 +1346,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--output-dir", default=None, help=f"results directory (default: {DEFAULT_OUTPUT_ROOT}/<UTC ts>)"
     )
     parser.add_argument(
-        "--scenario", action="append", choices=["1", "2", "3"], help="run only this scenario (repeatable)"
+        "--scenario", action="append", choices=["1", "2", "3", "4"], help="run only this scenario (repeatable)"
     )
     parser.add_argument("--dry-run", action="store_true", help="print planned command sequences; no DTU required")
     parser.add_argument(
@@ -796,7 +1362,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3"])})
+    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4"])})
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_ROOT) / run_id
     cfg = Config(
