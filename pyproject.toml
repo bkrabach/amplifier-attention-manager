@@ -22,6 +22,13 @@ attractor = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# Required because the [attractor] extra is a direct git reference; without
+# this, hatchling refuses to build the wheel AT ALL (even base installs fail,
+# since metadata is validated regardless of which extras are requested).
+# Found by DTU validation: uv tool install of 8c03c1b failed for every form.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/attention_manager"]
 
