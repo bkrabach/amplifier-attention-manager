@@ -11,6 +11,12 @@ attention-manager = "attention_manager.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+# The core package is stdlib-only by design. The attractor work-unit runner
+# (attention-manager workunit run) needs the shipped pipeline engine; all
+# imports of it are lazy, so the base install never pulls this in.
+attractor = [
+    "amplifier-module-loop-pipeline @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/loop-pipeline",
+]
 
 [build-system]
 requires = ["hatchling"]

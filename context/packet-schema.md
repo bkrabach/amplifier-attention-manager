@@ -143,12 +143,17 @@ specific message — never write a best-effort packet:
 3. `question` non-empty.
 4. `options` non-empty; every option has non-empty `id` and `label`; ids unique.
 5. `permission` packets: exactly the two options `allow` / `deny`.
-6. `recommendation.option`, `urgency.on_timeout.option`, and
+6. `attractor-gate` packets: at least two options. A single-option gate is
+   not a decision a cold reader can make — the producer must fail loud (name
+   the gate/stage), never synthesize a fake alternative. (Additive tightening
+   for a kind that had no producers before it was introduced; schema_version
+   stays 1.)
+7. `recommendation.option`, `urgency.on_timeout.option`, and
    `resolution.answer` (when present) MUST each be one of `options[].id`.
-7. `context` ≤ 8000 characters.
-8. `urgency.tier` ∈ {batch, today, now}; `on_timeout.action` ∈
+8. `context` ≤ 8000 characters.
+9. `urgency.tier` ∈ {batch, today, now}; `on_timeout.action` ∈
    {apply-option, fail-loud}; `apply-option` requires `option`.
-9. `resolution` (when present) has `answer`, `answered_by`, `answered_at`.
+10. `resolution` (when present) has `answer`, `answered_by`, `answered_at`.
 
 ## The cold-reader test
 

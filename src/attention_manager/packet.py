@@ -201,6 +201,13 @@ class Packet:
                 f"permission packets require exactly options {list(PERMISSION_OPTION_IDS)}, got {ids}",
             )
 
+        if self.source.kind == "attractor-gate":
+            _require(
+                len(self.options) >= 2,
+                f"attractor-gate packets require at least 2 options (a single-option gate is not a "
+                f"decision a cold reader can make), got {ids}",
+            )
+
         if self.recommendation is not None:
             _require(
                 self.recommendation.option in ids,

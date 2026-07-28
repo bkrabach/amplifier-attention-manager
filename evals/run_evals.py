@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""attention-manager evaluation harness (build steps 1-4).
+"""attention-manager evaluation harness (build steps 1-5).
 
 Runs the scenarios in evals/scenarios/ INSIDE an already-running DTU
 (or any environment reachable via an exec command prefix):
@@ -304,6 +304,31 @@ S6_ASSERTION_NAMES = [
     "ledger-summary-renders",
 ]
 
+# -- scenario 7 (attractor gate) constants -------------------------------------------
+
+S7_TIMEOUT_S = 300.0  # deterministic, NO LLM: hexagon + parallelogram tool nodes only
+S7_NAME = "wu-eval"  # workunit name -> source.work_unit on the gate packet
+S7_GATE_WAIT_S = 60.0  # budget for the attractor-gate packet to appear
+S7_COMPLETE_WAIT_S = 60.0  # budget for workunit completion after the answer
+S7_EVENT_WAIT_S = 15.0  # budget for gate:packet_created (emitted alongside the write)
+S7_QUESTION = "Approve the work unit?"  # gate.dot hexagon prompt
+
+# Markers proving the [attractor] extra is missing (attractor_gate.INSTALL_HINT
+# names the extra; a raw traceback names the module). Honest env failure —
+# graded could-not-evaluate with the text captured, never softened or skipped.
+S7_MISSING_EXTRA_MARKERS = ("amplifier-attention-manager[attractor]", "amplifier_module_loop_pipeline")
+
+S7_ASSERTION_NAMES = [
+    "workunit-launched",
+    "gate-packet-shape",
+    "events-gate-created",
+    "answer-accepted",
+    "workunit-completed",
+    "route-A-taken",
+    "events-answered-finished",
+    "ledger-workunit-finished",
+]
+
 CNE = "could-not-evaluate"
 
 # CSI + OSC ANSI escape sequences (tmux pipe-pane logs carry terminal control codes).
@@ -434,6 +459,16 @@ SPECS = {
         bundle_rel="",  # no bundle: judge mechanics are deterministic (S4 proves LLM supervision)
         answer_option="",
         timeout_s=S6_TIMEOUT_S,
+    ),
+    7: ScenarioSpec(
+        number=7,
+        slug="s7-attractor-gate",
+        title="Scenario 7 — attractor gate (step 5, deterministic pipeline)",
+        kind="attractor-gate",
+        prompt="",  # no LLM: the pipeline is hexagon + parallelogram tool nodes only
+        bundle_rel="evals/pipelines/gate.dot",  # the pipeline, not a bundle
+        answer_option="A",
+        timeout_s=S7_TIMEOUT_S,
     ),
 }
 
@@ -653,6 +688,36 @@ def cmd_dispatch_fake(
 
 def cmd_ledger_summary(cfg: Config, queue_dir: str, home: str) -> str:
     return f"{_env_prefix(queue_dir, home)} {cfg.am_cli} --json ledger --summary"
+
+
+# -- scenario-7 command builders (attractor gate) -------------------------------------
+
+
+def cmd_workunit_launch(
+    cfg: Config, queue_dir: str, home: str, dtu_sdir: str, workdir: str, pipeline_path: str, name: str
+) -> str:
+    """Background-launch `workunit run` in its own process group, cwd = workdir.
+
+    The pipeline's tool nodes (`tool_command="echo A > A.txt"`) execute relative
+    to the PROCESS cwd (verified: workunit.py never chdirs; the local smoke does
+    `cd "$workdir" && exec ... workunit run`), hence the explicit `cd` here.
+    Same pgid-file pattern as the supervisor/worker launches: `echo $$` inside
+    the setsid'd bash is the group leader; wu.exit captures the exit code.
+    """
+    pgid_file = f"{dtu_sdir}/wu.pgid"
+    log = f"{dtu_sdir}/wu.log"
+    exit_file = f"{dtu_sdir}/wu.exit"
+    inner = (
+        f"echo $$ > {shlex.quote(pgid_file)}; "
+        f"{_env_prefix(queue_dir, home)} "
+        f"cd {shlex.quote(workdir)} && "
+        f"{cfg.am_cli} workunit run {shlex.quote(pipeline_path)} --name {shlex.quote(name)} "
+        f"> {shlex.quote(log)} 2>&1; echo $? > {shlex.quote(exit_file)}"
+    )
+    return (
+        f"mkdir -p {shlex.quote(queue_dir)} {shlex.quote(home)} {shlex.quote(workdir)} && "
+        f"setsid bash -c {shlex.quote(inner)} < /dev/null > /dev/null 2>&1 & echo $!"
+    )
 
 
 # -- exec layer --------------------------------------------------------------------
@@ -2008,6 +2073,215 @@ def run_scenario_6(cfg: Config) -> ScenarioResult:
             s.ex.run(cmd_tmux_kill(session), label=f"cleanup-kill-{session}")
 
 
+# -- scenario 7: attractor gate (step 5) ----------------------------------------------
+
+
+def _s7_error_excerpt(log_text: str) -> str:
+    """Extract the missing-extra error lines from the workunit log (capped)."""
+    lines = [ln.strip() for ln in log_text.splitlines() if any(m in ln for m in S7_MISSING_EXTRA_MARKERS)]
+    return " | ".join(lines)[:500] if lines else log_text.strip()[-400:]
+
+
+def _collect_s7_artifacts(s: Scenario, home: str, dtu_sdir: str, workdir: str) -> None:
+    """Best-effort artifact collection — runs even when the scenario bails early."""
+    pipeline_logs_cmd = (
+        f"find {shlex.quote(home + '/workunits')} -type f 2>/dev/null | sort | "
+        f'while read -r f; do echo "=== $f ==="; cat "$f"; echo; done'
+    )
+    workdir_state_cmd = (
+        f"ls -la {shlex.quote(workdir)} 2>/dev/null; echo ---; "
+        f"echo A.txt:; cat {shlex.quote(workdir)}/A.txt 2>/dev/null; "
+        f"echo R.txt:; cat {shlex.quote(workdir)}/R.txt 2>/dev/null; true"
+    )
+    artifacts = [
+        ("workunit-log", cmd_cat(f"{dtu_sdir}/wu.log"), "workunit.log"),
+        ("workunit-exit", cmd_cat(f"{dtu_sdir}/wu.exit"), "workunit.exit"),
+        ("events", cmd_cat(f"{home}/events.jsonl"), "events.jsonl"),
+        ("ledger", cmd_ledger_cat(home), "ledger.jsonl"),
+        ("pipeline-logs", pipeline_logs_cmd, "pipeline-logs.txt"),
+        ("workdir-state", workdir_state_cmd, "workdir-state.txt"),
+    ]
+    for label, cmd, filename in artifacts:
+        try:
+            result = s.ex.run(cmd, label=f"artifact-{label}")
+            if result.rc == 0:
+                (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
+        except Exception as e:  # artifact collection must never mask the verdict
+            print(f"    (artifact {label} not collected: {e})")
+
+
+def run_scenario_7(cfg: Config) -> ScenarioResult:
+    spec = SPECS[7]
+    s = Scenario(cfg, spec)
+    started = time.monotonic()
+    home = f"{s.dtu_sdir}/home"
+    workdir = f"{s.dtu_sdir}/work"
+    wu_exit = f"{s.dtu_sdir}/wu.exit"
+    wu_log = f"{s.dtu_sdir}/wu.log"
+    pipeline = f"{cfg.repo_dir}/{spec.bundle_rel}"
+    wu_pgid: str | None = None
+    try:
+        # 1. Launch the workunit in the background (cwd = workdir; pgid captured).
+        s.ex.run(
+            cmd_workunit_launch(cfg, s.queue_dir, home, s.dtu_sdir, workdir, pipeline, S7_NAME),
+            label="workunit-launch",
+        )
+        wu_pgid = _poll_pgid_file(s.ex, f"{s.dtu_sdir}/wu.pgid", "wu-pgid-read")
+        if wu_pgid is None:
+            s.cne("workunit-launched", "wu.pgid never appeared")
+            _cne_rest(s, S7_ASSERTION_NAMES, "workunit never launched")
+            return _finish(s, started)
+
+        # 2. Poll for the attractor-gate packet, detecting early death (e.g. the
+        #    [attractor] extra missing — an honest env failure, captured loud).
+        dead = {"flag": False}
+
+        def poll_gate() -> dict[str, Any] | None:
+            probe = s.ex.run(cmd_file_exists(wu_exit), label="wu-exit-probe")
+            if probe.stdout.strip() == "yes":
+                dead["flag"] = True
+                return {}  # sentinel: stop polling, handle below
+            result = s.ex.run(cmd_queue_list(cfg, s.queue_dir), label="queue-list-poll")
+            s.snapshot("queue-list-poll", result)
+            if result.rc != 0:
+                return None
+            try:
+                listed = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return None
+            for p in listed:
+                if isinstance(p, dict) and (p.get("source") or {}).get("kind") == spec.kind:
+                    return p
+            return None
+
+        found = _poll(s, S7_GATE_WAIT_S, poll_gate)
+        if dead["flag"]:
+            exit_code = s.ex.run(cmd_cat(wu_exit), label="wu-exit-read").stdout.strip()
+            log_text = s.ex.run(cmd_cat(wu_log), label="wu-log-read").stdout
+            (s.out_dir / "workunit.log").write_text(log_text, encoding="utf-8")
+            if any(m in log_text for m in S7_MISSING_EXTRA_MARKERS):
+                s.cne(
+                    "workunit-launched",
+                    f"the [attractor] extra is NOT installed in this environment — honest env failure "
+                    f"(workunit exited {exit_code} before publishing a gate). Captured error: "
+                    f"{_s7_error_excerpt(log_text)}",
+                )
+            else:
+                s.check(
+                    "workunit-launched",
+                    False,
+                    f"workunit died (exit {exit_code}) before publishing a gate; log tail: {log_text[-400:]!r}",
+                )
+            _cne_rest(s, S7_ASSERTION_NAMES, "workunit died before publishing a gate")
+            return _finish(s, started)
+        if found is None:
+            s.check("workunit-launched", True, f"pgid {wu_pgid} (process still running)")
+            s.check("gate-packet-shape", False, f"no kind={spec.kind} packet within {S7_GATE_WAIT_S:.0f}s")
+            _cne_rest(s, S7_ASSERTION_NAMES, "gate packet never appeared")
+            return _finish(s, started)
+
+        packet = found
+        packet_id = str(packet.get("id", ""))
+        s.check("workunit-launched", True, f"pgid {wu_pgid}; gate packet {packet_id} published")
+        (s.out_dir / "packet-pending.json").write_text(json.dumps(packet, indent=2), encoding="utf-8")
+
+        # 3. Packet shape.
+        option_ids = [o.get("id") for o in packet.get("options", []) if isinstance(o, dict)]
+        option_labels = [str(o.get("label", "")) for o in packet.get("options", []) if isinstance(o, dict)]
+        work_unit = (packet.get("source") or {}).get("work_unit")
+        shape_ok = (
+            packet.get("question") == S7_QUESTION
+            and option_ids == ["A", "R"]
+            and len(option_labels) == 2
+            and "Approve" in option_labels[0]
+            and "Reject" in option_labels[1]
+            and work_unit == S7_NAME
+            and "stage: gate" in str(packet.get("context", ""))
+        )
+        s.check(
+            "gate-packet-shape",
+            shape_ok,
+            f"question={packet.get('question')!r}, options={list(zip(option_ids, option_labels))}, "
+            f"work_unit={work_unit!r}, context={str(packet.get('context', ''))[:80]!r}",
+        )
+
+        # 4. gate:packet_created event (emitted alongside the queue write).
+        def poll_created() -> list[dict[str, Any]] | None:
+            events_now, _ = _fetch_events(s, home)
+            created = [e for e in _events_named(events_now, "gate:packet_created") if e.get("packet_id") == packet_id]
+            return created or None
+
+        created = _poll(s, S7_EVENT_WAIT_S, poll_created)
+        if created is None:
+            s.check(
+                "events-gate-created",
+                False,
+                f"no gate:packet_created event for {packet_id} within {S7_EVENT_WAIT_S:.0f}s",
+            )
+        else:
+            ev = created[0]
+            s.check(
+                "events-gate-created",
+                ev.get("work_unit") == S7_NAME and bool(ev.get("packet_id")),
+                f"{{work_unit: {ev.get('work_unit')!r}, stage: {ev.get('stage')!r}, packet_id: {ev.get('packet_id')!r}}}",
+            )
+
+        # 5. Answer A.
+        answer = s.answer(packet_id, spec.answer_option)
+        s.check("answer-accepted", answer.rc == 0, f"answer rc={answer.rc} stderr={answer.stderr.strip()[:150]!r}")
+
+        # 6. Workunit completes exit 0.
+        exit_content: str | None = None
+        deadline = time.monotonic() + min(S7_COMPLETE_WAIT_S, max(0.0, s.remaining()))
+        while time.monotonic() < deadline:
+            probe = s.ex.run(cmd_file_exists(wu_exit), label="wu-exit-poll")
+            if probe.stdout.strip() == "yes":
+                exit_content = s.ex.run(cmd_cat(wu_exit), label="wu-exit-read").stdout.strip()
+                break
+            time.sleep(POLL_INTERVAL_S)
+        if exit_content is None:
+            s.cne("workunit-completed", f"wu.exit never appeared within {S7_COMPLETE_WAIT_S:.0f}s after the answer")
+        else:
+            s.check("workunit-completed", exit_content == "0", f"wu.exit={exit_content!r}")
+
+        # 7. Route: A.txt (content "A") exists, R.txt absent.
+        a_txt = s.ex.run(cmd_cat(f"{workdir}/A.txt"), label="a-txt-read")
+        r_absent = s.ex.run(cmd_file_absent(f"{workdir}/R.txt"), label="r-txt-absent")
+        s.check(
+            "route-A-taken",
+            a_txt.rc == 0 and a_txt.stdout.strip() == "A" and r_absent.stdout.strip() == "absent",
+            f"A.txt rc={a_txt.rc} content={a_txt.stdout.strip()!r}; R.txt: {r_absent.stdout.strip()}",
+        )
+
+        # 8. Events: gate:answered {answer: A} + workunit:finished {status: success}.
+        events, malformed = _fetch_events(s, home)
+        answered_evs = [e for e in _events_named(events, "gate:answered") if e.get("packet_id") == packet_id]
+        finished_evs = [e for e in _events_named(events, "workunit:finished") if e.get("name") == S7_NAME]
+        s.check(
+            "events-answered-finished",
+            len(answered_evs) == 1
+            and answered_evs[0].get("answer") == spec.answer_option
+            and len(finished_evs) == 1
+            and finished_evs[0].get("status") == "success",
+            f"gate:answered answers={[e.get('answer') for e in answered_evs]}, "
+            f"workunit:finished statuses={[e.get('status') for e in finished_evs]} (malformed lines: {malformed})",
+        )
+
+        # 9. Ledger: workunit_finished.
+        ledger_records, bad = _parse_jsonl(s.ex.run(cmd_ledger_cat(home), label="ledger-fetch").stdout)
+        wu_entries = [r for r in ledger_records if r.get("kind") == "workunit_finished" and r.get("name") == S7_NAME]
+        s.check(
+            "ledger-workunit-finished",
+            len(wu_entries) == 1 and wu_entries[0].get("status") == "success",
+            f"entries={wu_entries}, malformed={bad}",
+        )
+        return _finish(s, started)
+    finally:
+        _collect_s7_artifacts(s, home, s.dtu_sdir, workdir)
+        if wu_pgid:
+            s.ex.run(cmd_kill_group(wu_pgid), label="cleanup-kill-workunit")
+
+
 def _grade_decision_schema(show: ExecResult) -> tuple[bool, str]:
     if show.rc != 0:
         return False, f"queue show rc={show.rc} stderr={show.stderr.strip()!r}"
@@ -2039,6 +2313,7 @@ RUNNERS = {
     4: run_scenario_4,
     5: run_scenario_5,
     6: run_scenario_6,
+    7: run_scenario_7,
 }
 
 
@@ -2272,6 +2547,49 @@ def _plan_scenario_6(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     return steps
 
 
+def _plan_scenario_7(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[str, str]]:
+    home = f"{dtu_sdir}/home"
+    workdir = f"{dtu_sdir}/work"
+    pipeline = f"{cfg.repo_dir}/{SPECS[7].bundle_rel}"
+    pkt, wu_pgid = "<PACKET_ID>", "<WU_PGID>"
+    return [
+        (
+            "launch workunit in background (own process group; cwd = workdir so tool nodes write relative "
+            "A.txt/R.txt there; stdout+stderr -> wu.log; exit -> wu.exit; pgid -> wu.pgid)",
+            cmd_workunit_launch(cfg, queue_dir, home, dtu_sdir, workdir, pipeline, S7_NAME),
+        ),
+        ("read the workunit's real pgid (poll until non-empty)", cmd_read_pgid(f"{dtu_sdir}/wu.pgid")),
+        (
+            f"poll every {POLL_INTERVAL_S:.0f}s (<= {S7_GATE_WAIT_S:.0f}s) for a kind=attractor-gate packet, "
+            "checking wu.exit each iteration (early death + missing-[attractor]-extra marker in wu.log => "
+            "assertion 1 could-not-evaluate with the error text captured — honest env failure)",
+            cmd_queue_list(cfg, queue_dir),
+        ),
+        (
+            f"grade packet shape: question == {S7_QUESTION!r}, option ids exactly [A, R] with labels containing "
+            f"Approve/Reject, source.work_unit == {S7_NAME!r}, 'stage: gate' in context",
+            cmd_queue_show(cfg, queue_dir, pkt),
+        ),
+        (
+            f"grade events (<= {S7_EVENT_WAIT_S:.0f}s): gate:packet_created with work_unit + packet_id",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        ("answer A via the CLI", cmd_answer(cfg, queue_dir, pkt, "A", "eval")),
+        (
+            f"poll (<= {S7_COMPLETE_WAIT_S:.0f}s) for workunit completion; grade exit 0",
+            cmd_file_exists(f"{dtu_sdir}/wu.exit"),
+        ),
+        ("grade route: A.txt exists with content 'A'", cmd_cat(f"{workdir}/A.txt")),
+        ("grade route: R.txt does NOT exist", cmd_file_absent(f"{workdir}/R.txt")),
+        (
+            "grade events: gate:answered {answer: A} + workunit:finished {name: wu-eval, status: success}",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        ("grade ledger: one workunit_finished {name: wu-eval, status: success}", cmd_ledger_cat(home)),
+        ("cleanup: kill workunit process group (best-effort)", cmd_kill_group(wu_pgid)),
+    ]
+
+
 def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
     dtu_sdir = f"{cfg.work_dir}/{cfg.run_id}/{spec.slug}"
     queue_dir = f"{dtu_sdir}/queue"
@@ -2283,6 +2601,8 @@ def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
         return _plan_scenario_5(cfg, dtu_sdir, queue_dir)
     if spec.number == 6:
         return _plan_scenario_6(cfg, dtu_sdir, queue_dir)
+    if spec.number == 7:
+        return _plan_scenario_7(cfg, dtu_sdir, queue_dir)
     steps: list[tuple[str, str]] = [
         (
             "launch worker in background (own process group; stdout+stderr -> worker.log; "
@@ -2396,7 +2716,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--scenario",
         action="append",
-        choices=["1", "2", "3", "4", "5", "6"],
+        choices=["1", "2", "3", "4", "5", "6", "7"],
         help="run only this scenario (repeatable)",
     )
     parser.add_argument("--dry-run", action="store_true", help="print planned command sequences; no DTU required")
@@ -2413,7 +2733,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4", "5", "6"])})
+    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4", "5", "6", "7"])})
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_ROOT) / run_id
     cfg = Config(

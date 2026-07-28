@@ -1,0 +1,17 @@
+// Minimal hexagon-gate pipeline for the attractor async_ask producer
+// (build step 5). Verified shape: start -> gate (two labeled edges with
+// accelerator keys) -> tool nodes -> exit. Answering "A" must create A.txt
+// and not R.txt (and vice versa). Used by tests/ and
+// scripts/local_attractor_smoke.sh.
+digraph {
+    start [shape=Mdiamond];
+    gate [shape=hexagon, prompt="Approve the work unit?"];
+    pathA [shape=parallelogram, tool_command="echo A > A.txt"];
+    pathR [shape=parallelogram, tool_command="echo R > R.txt"];
+    done [shape=Msquare];
+    start -> gate;
+    gate -> pathA [label="[A] Approve"];
+    gate -> pathR [label="[R] Reject"];
+    pathA -> done;
+    pathR -> done;
+}

@@ -18,6 +18,7 @@ Commands:
     attention-manager rulebook proposals [--json]
     attention-manager rulebook apply <id>
     attention-manager rulebook reject <id> --reason TEXT
+    attention-manager workunit run <pipeline.dot> [--name NAME] [--logs-dir DIR]
     attention-manager status              # workers + pending packet count
     attention-manager ledger [--date YYYY-MM-DD] [--summary]
 
@@ -34,6 +35,7 @@ from datetime import datetime
 from datetime import timezone
 
 from . import workers
+from . import workunit
 from .judge import DEFAULT_JUDGE_TIMEOUT_S
 from .judge import verify as judge_verify
 from .packet import Packet
@@ -505,6 +507,24 @@ def build_parser() -> argparse.ArgumentParser:
     reject_p.add_argument("proposal_id")
     reject_p.add_argument("--reason", required=True, help="why the proposal is wrong (calibration data)")
 
+    workunit_p = sub.add_parser(
+        "workunit",
+        help="run an attractor pipeline as a headless work unit (requires the [attractor] extra)",
+    )
+    workunit_sub = workunit_p.add_subparsers(dest="workunit_command", required=True)
+    wu_run_p = workunit_sub.add_parser(
+        "run",
+        help="run a pipeline .dot headless; hexagon gates publish attractor-gate packets to the queue",
+    )
+    wu_run_p.add_argument("pipeline", help="path to the pipeline .dot file")
+    wu_run_p.add_argument("--name", default=None, help="work-unit name (default: the .dot file stem)")
+    wu_run_p.add_argument(
+        "--logs-dir",
+        dest="logs_dir",
+        default=None,
+        help="engine logs root (default: $ATTENTION_HOME/workunits/<name>/)",
+    )
+
     sub.add_parser("status", help="workers with state + pending packet count")
 
     ledger_p = sub.add_parser("ledger", help="show the daily ledger")
@@ -543,12 +563,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.judge_command == "verify":
                 return _cmd_judge_verify(args, args.json)
             raise ValueError(f"unhandled judge command {args.judge_command!r}")  # pragma: no cover
+        if args.command == "workunit":
+            if args.workunit_command == "run":
+                return workunit.cmd_run(args, args.json)
+            raise ValueError(f"unhandled workunit command {args.workunit_command!r}")  # pragma: no cover
         if args.command == "status":
             return _cmd_status(queue, args.json)
         if args.command == "ledger":
             return _cmd_ledger(args, args.json)
         raise ValueError(f"unhandled command {args.command!r}")  # pragma: no cover
-    except (ValueError, KeyError, OSError, RuntimeError) as e:
+    except (ValueError, KeyError, OSError, RuntimeError, ImportError) as e:
         message = e.args[0] if (isinstance(e, KeyError) and e.args) else str(e)
         print(f"error: {message}", file=sys.stderr)
         return 1
