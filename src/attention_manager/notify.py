@@ -40,10 +40,11 @@ def _truncate(text: str, width: int = QUESTION_TRUNCATE) -> str:
 
 @dataclass
 class BatchItem:
-    packet_id: str
+    packet_id: str  # packet id for kind="packet"; worker session name for finish-line kinds
     question: str
     ts: str  # wall-clock ISO, for the delivered payload
     enqueued_at: float  # monotonic, for the window policy
+    kind: str = "packet"  # "packet" | "finish_line" | "finish_line_failed"
 
 
 class Sink(Protocol):
@@ -66,7 +67,7 @@ class FileSink:
             {
                 "ts": utc_now_iso(),
                 "count": len(items),
-                "packets": [{"id": i.packet_id, "question": i.question} for i in items],
+                "packets": [{"id": i.packet_id, "question": i.question, "kind": i.kind} for i in items],
             }
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +83,8 @@ class ConsoleSink:
     def deliver(self, items: list[BatchItem]) -> None:
         print(f"[attention] {len(items)} packet(s) need you:")
         for item in items:
-            print(f"  {item.packet_id}: {_truncate(item.question)}")
+            prefix = "" if item.kind == "packet" else f"[{item.kind}] "
+            print(f"  {prefix}{item.packet_id}: {_truncate(item.question)}")
 
 
 class NtfySink:
@@ -152,8 +154,10 @@ class NotificationBatcher:
     def _now(self) -> float:
         return self.clock()  # type: ignore[operator]
 
-    def enqueue(self, packet_id: str, question: str) -> None:
-        self.items.append(BatchItem(packet_id=packet_id, question=question, ts=utc_now_iso(), enqueued_at=self._now()))
+    def enqueue(self, packet_id: str, question: str, kind: str = "packet") -> None:
+        self.items.append(
+            BatchItem(packet_id=packet_id, question=question, ts=utc_now_iso(), enqueued_at=self._now(), kind=kind)
+        )
 
     def due(self) -> bool:
         if not self.items:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""attention-manager evaluation harness (build steps 1-3).
+"""attention-manager evaluation harness (build steps 1-4).
 
 Runs the scenarios in evals/scenarios/ INSIDE an already-running DTU
 (or any environment reachable via an exec command prefix):
@@ -261,6 +261,49 @@ S5_ASSERTION_NAMES = [
     "rulebook-apply-branch",
 ]
 
+# -- scenario 6 (judged finish lines) constants ------------------------------------
+
+S6_TIMEOUT_S = 300.0  # FAKE workers, no LLM — deterministic judge mechanics
+S6_FINISH_WAIT_S = 120.0  # budget for all 3 worker:finished events
+S6_NOTIFY_WAIT_S = 60.0  # budget for finish-line notification items
+S6_BATCH_WINDOW_S = 5.0  # supervise --batch-window (speed; nothing batching-related is asserted beyond delivery)
+
+S6_MARKER = "GOOD-MARKER"
+
+# Judge for `judge verify` — reads $ARTIFACT per the judge contract, prints a reason both ways.
+S6_VERIFY_JUDGE_CMD = (
+    f'if grep -q {S6_MARKER} "$ARTIFACT"; then echo "PASS: marker"; else echo "FAIL: no marker"; exit 1; fi'
+)
+
+# Judge for dispatched workers — RELATIVE artifact.txt (proves the judge-cwd
+# contract: the supervisor runs judges with cwd = the worker's dir), prints a
+# reason both ways per the contract, and references $WORKER_EXIT (env plumbing
+# visible in judge.log / judge_output).
+S6_WORKER_JUDGE_CMD = (
+    f"if grep -q {S6_MARKER} artifact.txt 2>/dev/null; "
+    f'then echo "PASS: marker found (worker exit: $WORKER_EXIT)"; '
+    f'else echo "FAIL: marker missing from artifact"; exit 1; fi'
+)
+
+# Fixed worker names per the flow contract: g/b/u -> am-g / am-b / am-u.
+S6_SESSIONS = ("am-g", "am-b", "am-u")
+
+S6_ASSERTION_NAMES = [
+    "judge-verify-pass",
+    "judge-verify-rejects-decoration",
+    "supervisor-started",
+    "workers-dispatched",
+    "three-worker-finished",
+    "loop-closed-good",
+    "judge-log-good",
+    "loop-failed-bad",
+    "finished-judged-fields",
+    "unjudged-worker",
+    "notify-finish-line-items",
+    "ledger-counts",
+    "ledger-summary-renders",
+]
+
 CNE = "could-not-evaluate"
 
 # CSI + OSC ANSI escape sequences (tmux pipe-pane logs carry terminal control codes).
@@ -382,6 +425,16 @@ SPECS = {
         answer_option="",  # answer is the OPPOSITE of triage's recommendation
         timeout_s=S5_TIMEOUT_S,
     ),
+    6: ScenarioSpec(
+        number=6,
+        slug="s6-judged-finish-lines",
+        title="Scenario 6 — judged finish lines (step 4, fake workers)",
+        kind="decision",  # unused: no packets in this scenario
+        prompt="",  # fake --worker-cmd workers; see run_scenario_6
+        bundle_rel="",  # no bundle: judge mechanics are deterministic (S4 proves LLM supervision)
+        answer_option="",
+        timeout_s=S6_TIMEOUT_S,
+    ),
 }
 
 
@@ -468,7 +521,14 @@ def cmd_file_absent(path: str) -> str:
 
 
 def cmd_supervise_launch(
-    cfg: Config, queue_dir: str, home: str, dtu_sdir: str, notify_path: str, sup_log: str, pgid_file: str
+    cfg: Config,
+    queue_dir: str,
+    home: str,
+    dtu_sdir: str,
+    notify_path: str,
+    sup_log: str,
+    pgid_file: str,
+    batch_window_s: float = S4_BATCH_WINDOW_S,
 ) -> str:
     """Background-launch the supervisor in its own process group; record its PGID.
 
@@ -490,7 +550,7 @@ def cmd_supervise_launch(
         f"{_env_prefix(queue_dir, home)} "
         f"exec {cfg.am_cli} supervise --interval {S4_TICK_INTERVAL_S:g} "
         f"--notify {shlex.quote('file:' + notify_path)} "
-        f"--batch-window {S4_BATCH_WINDOW_S:g} --batch-max {S4_BATCH_MAX} "
+        f"--batch-window {batch_window_s:g} --batch-max {S4_BATCH_MAX} "
         f">> {shlex.quote(sup_log)} 2>&1"
     )
     return (
@@ -557,6 +617,42 @@ def cmd_triage_once(cfg: Config, queue_dir: str, home: str, bundle_uri: str, out
 
 def cmd_rulebook_apply(cfg: Config, queue_dir: str, home: str, proposal_id: str) -> str:
     return f"{_env_prefix(queue_dir, home)} {cfg.am_cli} rulebook apply {shlex.quote(proposal_id)}"
+
+
+# -- scenario-6 command builders (judged finish lines) -------------------------------
+
+
+def cmd_make_verify_artifacts(dtu_sdir: str) -> str:
+    """Write the good (marker) / broken (no marker) artifacts for `judge verify`."""
+    good = f"{dtu_sdir}/good-artifact.txt"
+    broken = f"{dtu_sdir}/broken-artifact.txt"
+    return (
+        f"mkdir -p {shlex.quote(dtu_sdir)} && "
+        f"echo {S6_MARKER} > {shlex.quote(good)} && "
+        f"echo 'no marker here' > {shlex.quote(broken)} && echo seeded"
+    )
+
+
+def cmd_judge_verify(cfg: Config, queue_dir: str, home: str, judge_cmd: str, good: str, broken: str) -> str:
+    return (
+        f"{_env_prefix(queue_dir, home)} {cfg.am_cli} judge verify "
+        f"--cmd {shlex.quote(judge_cmd)} --good {shlex.quote(good)} --broken {shlex.quote(broken)}"
+    )
+
+
+def cmd_dispatch_fake(
+    cfg: Config, queue_dir: str, home: str, name: str, task: str, worker_cmd: str, judge_cmd: str | None
+) -> str:
+    """Dispatch a fake --worker-cmd worker, optionally with a --judge command."""
+    judge_part = f" --judge {shlex.quote(judge_cmd)}" if judge_cmd else ""
+    return (
+        f"{_env_prefix(queue_dir, home)} {cfg.am_cli} dispatch {shlex.quote(name)} "
+        f"--task {shlex.quote(task)} --worker-cmd {shlex.quote(worker_cmd)}{judge_part}"
+    )
+
+
+def cmd_ledger_summary(cfg: Config, queue_dir: str, home: str) -> str:
+    return f"{_env_prefix(queue_dir, home)} {cfg.am_cli} --json ledger --summary"
 
 
 # -- exec layer --------------------------------------------------------------------
@@ -1652,6 +1748,266 @@ def run_scenario_5(cfg: Config) -> ScenarioResult:
         _collect_s5_artifacts(s, home)
 
 
+# -- scenario 6: judged finish lines (step 4) ----------------------------------------
+
+
+def _collect_s6_artifacts(s: Scenario, home: str, notify_path: str, sup_log: str) -> None:
+    """Best-effort artifact collection — runs even when the scenario bails early."""
+    artifacts = [
+        ("supervisor-log", cmd_cat(sup_log), "supervisor.log"),
+        ("events-copy", cmd_cat(f"{home}/events.jsonl"), "events.jsonl"),
+        ("ledger-copy", cmd_ledger_cat(home), "ledger.jsonl"),
+        ("notify-copy", cmd_cat(notify_path), "notify.jsonl"),
+        ("tmux-ls", cmd_tmux_ls(), "tmux-ls.txt"),
+        ("judge-log-g", cmd_cat(f"{home}/workers/am-g/judge.log"), "judge-am-g.log"),
+        ("judge-log-b", cmd_cat(f"{home}/workers/am-b/judge.log"), "judge-am-b.log"),
+        ("worker-log-g", cmd_cat(f"{home}/workers/am-g/worker.log"), "worker-am-g.log"),
+        ("worker-log-b", cmd_cat(f"{home}/workers/am-b/worker.log"), "worker-am-b.log"),
+        ("worker-log-u", cmd_cat(f"{home}/workers/am-u/worker.log"), "worker-am-u.log"),
+    ]
+    for label, cmd, filename in artifacts:
+        try:
+            result = s.ex.run(cmd, label=f"artifact-{label}")
+            if result.rc == 0:
+                (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
+        except Exception as e:  # artifact collection must never mask the verdict
+            print(f"    (artifact {label} not collected: {e})")
+
+
+def run_scenario_6(cfg: Config) -> ScenarioResult:
+    spec = SPECS[6]
+    s = Scenario(cfg, spec)
+    started = time.monotonic()
+    home = f"{s.dtu_sdir}/home"
+    notify_path = f"{s.dtu_sdir}/notify.jsonl"
+    sup_log = f"{s.dtu_sdir}/supervisor.log"
+    sup_pgid_file = f"{s.dtu_sdir}/supervisor.pgid"
+    good_art = f"{s.dtu_sdir}/good-artifact.txt"
+    broken_art = f"{s.dtu_sdir}/broken-artifact.txt"
+    sup_pids: list[str] = []
+    try:
+        # 0. Pre-clean fixed-name sessions.
+        for session in S6_SESSIONS:
+            s.ex.run(cmd_tmux_kill(session), label=f"pre-kill-{session}")
+
+        # 1a. judge verify — a WORKING judge passes both directions.
+        seeded = s.ex.run(cmd_make_verify_artifacts(s.dtu_sdir), label="seed-verify-artifacts")
+        if seeded.rc != 0:
+            s.cne("judge-verify-pass", f"could not seed verify artifacts (rc={seeded.rc})")
+            _cne_rest(s, S6_ASSERTION_NAMES, "verify artifacts missing")
+            return _finish(s, started)
+        verify = s.ex.run(
+            cmd_judge_verify(cfg, s.queue_dir, home, S6_VERIFY_JUDGE_CMD, good_art, broken_art),
+            label="judge-verify",
+        )
+        (s.out_dir / "judge-verify.out").write_text(verify.stdout + verify.stderr, encoding="utf-8")
+        s.check(
+            "judge-verify-pass",
+            verify.rc == 0 and "VERDICT: PASS" in verify.stdout,
+            f"rc={verify.rc}, VERDICT: PASS present={'VERDICT: PASS' in verify.stdout}",
+        )
+
+        # 1b. A decoration judge (never fails) must be REJECTED.
+        decoration = s.ex.run(
+            cmd_judge_verify(cfg, s.queue_dir, home, "true", good_art, broken_art),
+            label="judge-verify-decoration",
+        )
+        (s.out_dir / "judge-verify-decoration.out").write_text(decoration.stdout + decoration.stderr, encoding="utf-8")
+        s.check(
+            "judge-verify-rejects-decoration",
+            decoration.rc != 0,
+            f"rc={decoration.rc} (nonzero required: a judge that never fails is decoration)",
+        )
+
+        # 2. Supervisor up (short batch window; nothing beyond delivery asserted).
+        s.ex.run(
+            cmd_supervise_launch(
+                cfg,
+                s.queue_dir,
+                home,
+                s.dtu_sdir,
+                notify_path,
+                sup_log,
+                sup_pgid_file,
+                batch_window_s=S6_BATCH_WINDOW_S,
+            ),
+            label="supervise-launch",
+        )
+        pid = _poll_pgid_file(s.ex, sup_pgid_file, "supervisor-pgid-read")
+        if pid is None:
+            s.cne("supervisor-started", "supervisor.pgid never appeared")
+            _cne_rest(s, S6_ASSERTION_NAMES, "supervisor never started")
+            return _finish(s, started)
+        sup_pids.append(pid)
+        s.check("supervisor-started", True, f"supervisor pgid {pid} (from supervisor.pgid)")
+
+        # 3. Dispatch the fleet: G (marker artifact + judge), B (no marker, SAME judge), U (no judge).
+        fleet = {
+            "g": (f"echo {S6_MARKER} > {home}/workers/am-g/artifact.txt", S6_WORKER_JUDGE_CMD),
+            "b": (f"echo marker deliberately omitted > {home}/workers/am-b/artifact.txt", S6_WORKER_JUDGE_CMD),
+            "u": ("echo unjudged", None),
+        }
+        dispatch_details: list[str] = []
+        dispatch_ok = True
+        for name, (worker_cmd, judge_cmd) in fleet.items():
+            result = s.ex.run(
+                cmd_dispatch_fake(
+                    cfg, s.queue_dir, home, name, f"finish-line {name} worker (fake)", worker_cmd, judge_cmd
+                ),
+                label=f"dispatch-{name}",
+            )
+            dispatch_details.append(
+                f"{name}: rc={result.rc}" + (f" stderr={result.stderr.strip()[:120]!r}" if result.rc else "")
+            )
+            dispatch_ok = dispatch_ok and result.rc == 0
+        s.check("workers-dispatched", dispatch_ok, "; ".join(dispatch_details))
+        if not dispatch_ok:
+            _cne_rest(s, S6_ASSERTION_NAMES, "dispatch failed")
+            return _finish(s, started)
+
+        # 4. All three worker:finished events.
+        def poll_finished() -> list[dict[str, Any]] | None:
+            events_now, _ = _fetch_events(s, home)
+            finished_now = _events_named(events_now, "worker:finished")
+            return finished_now if len(finished_now) >= 3 else None
+
+        finished = _poll(s, S6_FINISH_WAIT_S, poll_finished)
+        if finished is None:
+            events_now, _ = _fetch_events(s, home)
+            s.check(
+                "three-worker-finished",
+                False,
+                f"expected 3 worker:finished within {S6_FINISH_WAIT_S:.0f}s, "
+                f"saw {len(_events_named(events_now, 'worker:finished'))}",
+            )
+            _cne_rest(s, S6_ASSERTION_NAMES, "workers never finished")
+            return _finish(s, started)
+        by_session = {str(e.get("session")): e for e in finished}
+        s.check(
+            "three-worker-finished",
+            len(finished) == 3 and set(by_session) == set(S6_SESSIONS),
+            f"sessions={sorted(by_session)}",
+        )
+
+        # 5. Judge-gated loop events.
+        events, malformed = _fetch_events(s, home)
+        closed = _events_named(events, "loop:closed")
+        failed = _events_named(events, "loop:failed")
+
+        closed_ok = (
+            len(closed) == 1
+            and closed[0].get("session") == "am-g"
+            and bool(str(closed[0].get("judge_output", "")).strip())
+        )
+        s.check(
+            "loop-closed-good",
+            closed_ok,
+            f"loop:closed count={len(closed)}, session={closed[0].get('session') if closed else None!r}, "
+            f"judge_output tail={str(closed[0].get('judge_output', ''))[:120]!r}"
+            if closed
+            else f"loop:closed count=0 (malformed lines: {malformed})",
+        )
+
+        judge_log = s.ex.run(cmd_cat(f"{home}/workers/am-g/judge.log"), label="judge-log-g-read")
+        s.check(
+            "judge-log-good",
+            judge_log.rc == 0 and bool(judge_log.stdout.strip()),
+            f"rc={judge_log.rc}, size={len(judge_log.stdout.strip())} chars",
+        )
+
+        failed_ok = (
+            len(failed) == 1 and failed[0].get("session") == "am-b" and bool(str(failed[0].get("reason", "")).strip())
+        )
+        s.check(
+            "loop-failed-bad",
+            failed_ok,
+            f"loop:failed count={len(failed)}, session={failed[0].get('session') if failed else None!r}, "
+            f"reason={str(failed[0].get('reason', ''))!r} (expected 'judge exited 1')"
+            if failed
+            else "loop:failed count=0",
+        )
+
+        g_ev, b_ev, u_ev = by_session.get("am-g", {}), by_session.get("am-b", {}), by_session.get("am-u", {})
+        s.check(
+            "finished-judged-fields",
+            g_ev.get("judged") is True
+            and g_ev.get("judge_result") == "closed"
+            and b_ev.get("judged") is True
+            and b_ev.get("judge_result") == "failed",
+            f"am-g: judged={g_ev.get('judged')}, judge_result={g_ev.get('judge_result')!r}; "
+            f"am-b: judged={b_ev.get('judged')}, judge_result={b_ev.get('judge_result')!r}",
+        )
+
+        u_loops = [e for e in closed + failed if e.get("session") == "am-u"]
+        s.check(
+            "unjudged-worker",
+            u_ev.get("judged") is False and u_ev.get("judge_result") is None and not u_loops,
+            f"am-u: judged={u_ev.get('judged')}, judge_result={u_ev.get('judge_result')!r}, "
+            f"loop:* events for am-u={len(u_loops)}",
+        )
+
+        # 6. Notification items: finish_line (am-g) + finish_line_failed (am-b).
+        def poll_notify() -> list[dict[str, Any]] | None:
+            result = s.ex.run(cmd_cat(notify_path), label="notify-fetch")
+            if result.rc != 0:
+                return None
+            batches, bad = _parse_jsonl(result.stdout)
+            items = [p for b in batches if isinstance(b.get("packets"), list) for p in b["packets"]]
+            has_line = any(i.get("kind") == "finish_line" and i.get("id") == "am-g" for i in items)
+            has_failed = any(i.get("kind") == "finish_line_failed" and i.get("id") == "am-b" for i in items)
+            return items if bad == 0 and has_line and has_failed else None
+
+        notify_items = _poll(s, S6_NOTIFY_WAIT_S, poll_notify)
+        if notify_items is None:
+            sink_raw = s.ex.run(cmd_cat(notify_path), label="notify-final-fetch")
+            s.check(
+                "notify-finish-line-items",
+                False,
+                f"finish_line(am-g) + finish_line_failed(am-b) items not found within {S6_NOTIFY_WAIT_S:.0f}s; "
+                f"sink content: {sink_raw.stdout.strip()[:400]!r}",
+            )
+        else:
+            kinds = [(i.get("kind"), i.get("id")) for i in notify_items]
+            s.check("notify-finish-line-items", True, f"items={kinds}")
+
+        # 7. Ledger counts.
+        ledger_records, ledger_malformed = _parse_jsonl(s.ex.run(cmd_ledger_cat(home), label="ledger-fetch").stdout)
+        kinds_count: dict[str, int] = {}
+        for record in ledger_records:
+            kind = str(record.get("kind"))
+            kinds_count[kind] = kinds_count.get(kind, 0) + 1
+        expected = {"loop_closed": 1, "loop_failed": 1, "worker_finished": 3, "dispatched": 3}
+        mismatches = {k: (kinds_count.get(k, 0), v) for k, v in expected.items() if kinds_count.get(k, 0) != v}
+        s.check(
+            "ledger-counts",
+            not mismatches and ledger_malformed == 0,
+            f"kinds={kinds_count}, mismatches={mismatches or 'none'}, malformed={ledger_malformed}",
+        )
+
+        # 8. ledger --summary --json renders both loops by name.
+        summary = s.ex.run(cmd_ledger_summary(cfg, s.queue_dir, home), label="ledger-summary")
+        (s.out_dir / "ledger-summary.json").write_text(summary.stdout, encoding="utf-8")
+        summary_ok = False
+        summary_detail = f"rc={summary.rc}"
+        if summary.rc == 0:
+            try:
+                data = json.loads(summary.stdout)
+                closed_sessions = [e.get("session") for e in data.get("loops_closed", [])]
+                failed_sessions = [e.get("session") for e in data.get("loops_failed", [])]
+                summary_ok = "am-g" in closed_sessions and "am-b" in failed_sessions
+                summary_detail = f"rc=0, loops_closed={closed_sessions}, loops_failed={failed_sessions}"
+            except json.JSONDecodeError as e:
+                summary_detail = f"rc=0 but output not JSON: {e}"
+        s.check("ledger-summary-renders", summary_ok, summary_detail)
+        return _finish(s, started)
+    finally:
+        _collect_s6_artifacts(s, home, notify_path, sup_log)
+        for sup_pid in sup_pids:
+            s.ex.run(cmd_kill_group(sup_pid), label="cleanup-kill-supervisor")
+        for session in S6_SESSIONS:
+            s.ex.run(cmd_tmux_kill(session), label=f"cleanup-kill-{session}")
+
+
 def _grade_decision_schema(show: ExecResult) -> tuple[bool, str]:
     if show.rc != 0:
         return False, f"queue show rc={show.rc} stderr={show.stderr.strip()!r}"
@@ -1676,7 +2032,14 @@ def _finish(s: Scenario, started: float) -> ScenarioResult:
     return result
 
 
-RUNNERS = {1: run_scenario_1, 2: run_scenario_2, 3: run_scenario_3, 4: run_scenario_4, 5: run_scenario_5}
+RUNNERS = {
+    1: run_scenario_1,
+    2: run_scenario_2,
+    3: run_scenario_3,
+    4: run_scenario_4,
+    5: run_scenario_5,
+    6: run_scenario_6,
+}
 
 
 # -- dry-run planner --------------------------------------------------------------------
@@ -1820,6 +2183,95 @@ def _plan_scenario_5(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     ]
 
 
+def _plan_scenario_6(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[str, str]]:
+    home = f"{dtu_sdir}/home"
+    notify_path = f"{dtu_sdir}/notify.jsonl"
+    sup_log = f"{dtu_sdir}/supervisor.log"
+    sup_pgid_file = f"{dtu_sdir}/supervisor.pgid"
+    good_art = f"{dtu_sdir}/good-artifact.txt"
+    broken_art = f"{dtu_sdir}/broken-artifact.txt"
+    sup_pid = "<SUP_PGID>"
+    steps: list[tuple[str, str]] = []
+    for session in S6_SESSIONS:
+        steps.append((f"pre-clean leftover {session} session (best-effort)", cmd_tmux_kill(session)))
+    steps += [
+        ("seed judge-verify artifacts: good (marker) + broken (no marker)", cmd_make_verify_artifacts(dtu_sdir)),
+        (
+            "judge verify: working grep-judge must PASS both directions (exit 0 + 'VERDICT: PASS')",
+            cmd_judge_verify(cfg, queue_dir, home, S6_VERIFY_JUDGE_CMD, good_art, broken_art),
+        ),
+        (
+            "judge verify: decoration judge ('true', never fails) must be REJECTED (nonzero exit)",
+            cmd_judge_verify(cfg, queue_dir, home, "true", good_art, broken_art),
+        ),
+        (
+            f"start supervisor (batch-window {S6_BATCH_WINDOW_S:g}s; pgid written to supervisor.pgid)",
+            cmd_supervise_launch(
+                cfg,
+                queue_dir,
+                home,
+                dtu_sdir,
+                notify_path,
+                sup_log,
+                sup_pgid_file,
+                batch_window_s=S6_BATCH_WINDOW_S,
+            ),
+        ),
+        ("read the supervisor's real pgid (poll until non-empty)", cmd_read_pgid(sup_pgid_file)),
+        (
+            "dispatch G: writes artifact WITH marker into its worker dir, exits 0; grep-judge on RELATIVE "
+            "artifact.txt (judge-cwd contract)",
+            cmd_dispatch_fake(
+                cfg,
+                queue_dir,
+                home,
+                "g",
+                "finish-line g worker (fake)",
+                f"echo {S6_MARKER} > {home}/workers/am-g/artifact.txt",
+                S6_WORKER_JUDGE_CMD,
+            ),
+        ),
+        (
+            "dispatch B: writes artifact WITHOUT marker, exits 0; SAME judge",
+            cmd_dispatch_fake(
+                cfg,
+                queue_dir,
+                home,
+                "b",
+                "finish-line b worker (fake)",
+                f"echo marker deliberately omitted > {home}/workers/am-b/artifact.txt",
+                S6_WORKER_JUDGE_CMD,
+            ),
+        ),
+        (
+            "dispatch U: echo unjudged, exits 0; NO judge",
+            cmd_dispatch_fake(cfg, queue_dir, home, "u", "finish-line u worker (fake)", "echo unjudged", None),
+        ),
+        (
+            f"poll every {POLL_INTERVAL_S:.0f}s (<= {S6_FINISH_WAIT_S:.0f}s) until 3 worker:finished events; then grade "
+            "loop:closed(am-g, judge_output) / loop:failed(am-b, reason) / judged fields / no loop:* for am-u",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        ("grade judge.log for am-g exists non-empty", cmd_cat(f"{home}/workers/am-g/judge.log")),
+        (
+            f"poll notify sink (<= {S6_NOTIFY_WAIT_S:.0f}s) for finish_line(am-g) + finish_line_failed(am-b) items",
+            cmd_cat(notify_path),
+        ),
+        (
+            "grade ledger counts: loop_closed x1, loop_failed x1, worker_finished x3, dispatched x3",
+            cmd_ledger_cat(home),
+        ),
+        (
+            "ledger --summary --json renders: am-g under loops_closed, am-b under loops_failed",
+            cmd_ledger_summary(cfg, queue_dir, home),
+        ),
+        ("cleanup: kill supervisor process group", cmd_kill_group(sup_pid)),
+    ]
+    for session in S6_SESSIONS:
+        steps.append((f"cleanup: kill tmux session {session}", cmd_tmux_kill(session)))
+    return steps
+
+
 def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
     dtu_sdir = f"{cfg.work_dir}/{cfg.run_id}/{spec.slug}"
     queue_dir = f"{dtu_sdir}/queue"
@@ -1829,6 +2281,8 @@ def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
         return _plan_scenario_4(cfg, dtu_sdir, queue_dir)
     if spec.number == 5:
         return _plan_scenario_5(cfg, dtu_sdir, queue_dir)
+    if spec.number == 6:
+        return _plan_scenario_6(cfg, dtu_sdir, queue_dir)
     steps: list[tuple[str, str]] = [
         (
             "launch worker in background (own process group; stdout+stderr -> worker.log; "
@@ -1940,7 +2394,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--output-dir", default=None, help=f"results directory (default: {DEFAULT_OUTPUT_ROOT}/<UTC ts>)"
     )
     parser.add_argument(
-        "--scenario", action="append", choices=["1", "2", "3", "4", "5"], help="run only this scenario (repeatable)"
+        "--scenario",
+        action="append",
+        choices=["1", "2", "3", "4", "5", "6"],
+        help="run only this scenario (repeatable)",
     )
     parser.add_argument("--dry-run", action="store_true", help="print planned command sequences; no DTU required")
     parser.add_argument(
@@ -1956,7 +2413,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4", "5"])})
+    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4", "5", "6"])})
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_ROOT) / run_id
     cfg = Config(

@@ -9,23 +9,27 @@ Each tick (default 2s):
    the seen-sets → emit ``packet:created`` / ``packet:answered`` events,
    enqueue created packets for notification batching, write ledger entries.
 2. Observe workers (tmux liveness + log sentinel) → emit ``worker:started``
-   (once) / ``worker:finished`` (sentinel or dead session).
+   (once) / ``worker:finished`` (sentinel or dead session). When the worker's
+   meta carries a ``judge_cmd`` (design §The Judge Requirement, step 4), the
+   judge runs on finish and gates loop closure: exit 0 → ``loop:closed``;
+   nonzero / timeout / spawn failure → ``loop:failed`` (loud). A configured
+   judge is NEVER silently skipped — any inability to run it IS loop:failed.
 3. Flush notification batches per policy (window / max / retry-on-failure).
 4. Persist state atomically.
 
-Step-2 scope deviations from the design's build-order wording — DELIBERATE,
-both for honesty:
+Step-2 scope deviation from the design's build-order wording — DELIBERATE,
+for honesty:
 
 (a) NO embedded-foundation LLM work. The design's build order mentions
     "embed foundation" at step 2, but the manager's own LLM work (triage,
     rulebook) is step 3; this supervisor is a plain Python loop and adding
     foundation embedding now would be ceremony around mechanics.
-(b) NO ``loop:closed`` events. Loop closure is judge-gated (design §The
-    Judge Requirement, build step 4). Emitting ``loop:closed`` without a
-    judge would be a fake finish line — exactly what the design's own
-    fail-loud rule (D7) forbids. Instead the supervisor emits
-    ``worker:finished`` with the exit code and an explicit
-    ``"judged": false`` field. Step 4 adds the judge and ``loop:closed``.
+
+(Resolved former deviation (b): ``loop:closed`` was deferred at step 2
+because emitting it without a judge would have been a fake finish line (D7).
+As of step 4 it EXISTS and is judge-gated: ``worker:finished`` carries
+``judged: true`` + ``judge_result: "closed"|"failed"`` when a judge ran, and
+``judged: false`` unchanged when the worker shipped no judge.)
 """
 
 from __future__ import annotations
@@ -42,6 +46,9 @@ from typing import Any
 from typing import TextIO
 
 from . import workers as workers_mod
+from .judge import DEFAULT_JUDGE_TIMEOUT_S
+from .judge import JudgeResult
+from .judge import run_judge
 from .notify import NotificationBatcher
 from .notify import parse_sink
 from .packet import Packet
@@ -90,12 +97,14 @@ class Supervisor:
         observe: Callable[[str, Path], Observation] | None = None,
         triage_every: int | None = None,
         triage_runner: TriageRunner | None = None,
+        judge_timeout_s: float = DEFAULT_JUDGE_TIMEOUT_S,
         err: TextIO | None = None,
     ):
         self.state = SupervisorState(home)
         self.state.load()
         self.queue = queue or PacketQueue()
         self.interval_s = interval_s
+        self.judge_timeout_s = judge_timeout_s
         self._list_sessions = list_sessions or workers_mod.list_am_sessions
         self._observe = observe or workers_mod.observe
         self._err = err or sys.stderr
@@ -205,14 +214,23 @@ class Supervisor:
             if obs.sentinel_seen or not obs.alive:
                 record["finished"] = True
                 record["exit_code"] = obs.exit_code
-                # judged: false — honest finish reporting. The judge-gated
-                # loop:closed event is step 4; faking it here would violate D7.
+
+                # Judge-gated finish lines (design §The Judge Requirement).
+                # A worker with a judge_cmd is judged on finish — ALWAYS. Any
+                # inability to run the judge is loop:failed, never a skip.
+                judge_cmd = record.get("judge_cmd")
+                judge_result: JudgeResult | None = None
+                if judge_cmd:
+                    judge_result = self._run_worker_judge(session, judge_cmd, obs.exit_code)
+
                 fields: dict[str, Any] = {
                     "session": session,
                     "name": record.get("name"),
                     "exit_code": obs.exit_code,
-                    "judged": False,
+                    "judged": judge_result is not None,
                 }
+                if judge_result is not None:
+                    fields["judge_result"] = "closed" if judge_result.passed else "failed"
                 if not obs.sentinel_seen:
                     fields["sentinel_missing"] = True  # dead session, no exit line — loud
                 self.state.append_event("worker:finished", **fields)
@@ -220,9 +238,87 @@ class Supervisor:
                     "worker_finished",
                     session=session,
                     exit_code=obs.exit_code,
-                    judged=False,
+                    judged=judge_result is not None,
+                    judge_result=fields.get("judge_result"),
                     sentinel_missing=not obs.sentinel_seen,
                 )
+                if judge_result is not None:
+                    self._report_judge_outcome(session, record, obs.exit_code, judge_result)
+
+    # -- judge-gated finish lines (design §The Judge Requirement, step 4) -----------
+
+    def _run_worker_judge(self, session: str, judge_cmd: str, worker_exit: int | None) -> JudgeResult:
+        """Run the worker's judge and persist its output to workers/<session>/judge.log.
+
+        cwd = the worker's dir; env carries ATTENTION_HOME, ATTENTION_QUEUE_DIR,
+        WORKER_LOG (abs path) and WORKER_EXIT (empty string when the session
+        died without a sentinel). Timeout / spawn failure come back as a
+        failed JudgeResult — never an exception, never a skip.
+        """
+        worker_dir = self.state.worker_dir(session)
+        worker_dir.mkdir(parents=True, exist_ok=True)  # cwd must exist even for adopted workers
+        result = run_judge(
+            judge_cmd,
+            cwd=worker_dir,
+            home=self.state.home,
+            queue_root=self.queue.root,
+            worker_log=self.state.worker_log_path(session).resolve(),
+            worker_exit=worker_exit,
+            timeout_s=self.judge_timeout_s,
+        )
+        log_text = result.output
+        if result.reason:
+            log_text = (log_text + "\n" if log_text and not log_text.endswith("\n") else log_text) + (
+                f"[attention-manager] {result.reason}\n"
+            )
+        (worker_dir / "judge.log").write_text(log_text, encoding="utf-8")
+        return result
+
+    def _report_judge_outcome(
+        self, session: str, record: dict[str, Any], worker_exit: int | None, result: JudgeResult
+    ) -> None:
+        """Emit loop:closed / loop:failed + ledger + notification for a judged worker."""
+        name = record.get("name")
+        if result.passed:
+            self.state.append_event(
+                "loop:closed", session=session, name=name, worker_exit=worker_exit, judge_output=result.output_tail
+            )
+            self.state.ledger_append(
+                "loop_closed", session=session, name=name, worker_exit=worker_exit, judge_output=result.output_tail
+            )
+            if self.batcher is not None:
+                self.batcher.enqueue(session, f"loop closed: {name} (worker exit {worker_exit})", kind="finish_line")
+            else:
+                self._warn_notifications_disabled()
+            return
+
+        # Loud failure: nonzero exit, timeout, or spawn failure — a configured
+        # judge that could not deliver a pass is ALWAYS loop:failed (D7).
+        self.state.append_event(
+            "loop:failed",
+            session=session,
+            name=name,
+            worker_exit=worker_exit,
+            reason=result.reason,
+            judge_output=result.output_tail,
+        )
+        self.state.ledger_append(
+            "loop_failed",
+            session=session,
+            name=name,
+            worker_exit=worker_exit,
+            reason=result.reason,
+            judge_output=result.output_tail,
+        )
+        print(
+            f"ERROR: loop:failed for {session}: {result.reason}"
+            + (f" — judge output tail: {result.output_tail}" if result.output_tail else ""),
+            file=self._err,
+        )
+        if self.batcher is not None:
+            self.batcher.enqueue(session, f"LOOP FAILED: {name} — {result.reason}", kind="finish_line_failed")
+        else:
+            self._warn_notifications_disabled()
 
     # -- notifications --------------------------------------------------------------
 

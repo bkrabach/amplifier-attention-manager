@@ -99,11 +99,13 @@ def kill_session(session: str) -> None:
     subprocess.run([tmux, "kill-session", "-t", f"={session}"], capture_output=True)
 
 
-def launch(name: str, cmd: str, home: Path, task: str | None = None) -> dict[str, Any]:
+def launch(name: str, cmd: str, home: Path, task: str | None = None, judge_cmd: str | None = None) -> dict[str, Any]:
     """Launch a worker command into a detached am-* tmux session.
 
     Creates ``<home>/workers/am-<name>/`` with worker.log + meta.json, starts
     the session with the sentinel wrapper, and attaches pipe-pane to the log.
+    ``judge_cmd`` (design §The Judge Requirement) is persisted in meta.json;
+    the supervisor runs it when the worker finishes to gate loop closure.
     Returns the meta dict. Raises RuntimeError (loud) on any tmux failure or
     if the session already exists.
     """
@@ -154,6 +156,7 @@ def launch(name: str, cmd: str, home: Path, task: str | None = None) -> dict[str
         "session": session,
         "cmd": cmd,
         "task": task,
+        "judge_cmd": judge_cmd,
         "started_at": utc_now_iso(),
     }
     tmp = worker_dir / "meta.json.tmp"

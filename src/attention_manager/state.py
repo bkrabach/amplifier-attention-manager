@@ -99,6 +99,7 @@ def new_worker_record(
     session: str,
     cmd: str | None = None,
     task: str | None = None,
+    judge_cmd: str | None = None,
     started_at: str | None = None,
     adopted_without_meta: bool = False,
 ) -> dict[str, Any]:
@@ -108,6 +109,7 @@ def new_worker_record(
         "session": session,
         "cmd": cmd,
         "task": task,
+        "judge_cmd": judge_cmd,
         "started_at": started_at,
         "adopted_without_meta": adopted_without_meta,
         "started_event_emitted": False,
@@ -244,6 +246,7 @@ class SupervisorState:
                     session=session,
                     cmd=meta.get("cmd"),
                     task=meta.get("task"),
+                    judge_cmd=meta.get("judge_cmd"),
                     started_at=meta.get("started_at"),
                 )
                 added.append(session)

@@ -6,17 +6,20 @@ Commands:
     attention-manager queue path          # queue root path
     attention-manager answer <id> <option> [--rationale TEXT]
     attention-manager dispatch <name> --task TEXT [--bundle URI] [--worker-cmd CMD]
+                               [--judge CMD]
     attention-manager supervise [--interval N] [--once] [--notify SINK]
                                 [--batch-window N] [--batch-max N]
                                 [--triage] [--triage-every N]
                                 [--triage-bundle URI] [--triage-timeout N]
+                                [--judge-timeout N]
+    attention-manager judge verify --cmd CMD --good PATH --broken PATH [--timeout N]
     attention-manager triage --once [--bundle URI] [--timeout N]
     attention-manager rulebook show
     attention-manager rulebook proposals [--json]
     attention-manager rulebook apply <id>
     attention-manager rulebook reject <id> --reason TEXT
     attention-manager status              # workers + pending packet count
-    attention-manager ledger [--date YYYY-MM-DD]
+    attention-manager ledger [--date YYYY-MM-DD] [--summary]
 
 Exit codes: 0 = ok, 1 = error (message on stderr).
 """
@@ -31,6 +34,8 @@ from datetime import datetime
 from datetime import timezone
 
 from . import workers
+from .judge import DEFAULT_JUDGE_TIMEOUT_S
+from .judge import verify as judge_verify
 from .packet import Packet
 from .queue import PacketQueue
 from .rulebook import Rulebook
@@ -118,9 +123,13 @@ def _cmd_dispatch(args: argparse.Namespace, as_json: bool) -> int:
     # supervisor adopts the new worker on its next tick.
     state = SupervisorState()
     cmd = args.worker_cmd or workers.default_worker_cmd(args.task, args.bundle)
-    meta = workers.launch(args.name, cmd, state.home, task=args.task)
-    state.append_event("worker:dispatched", session=meta["session"], name=args.name, cmd=cmd, task=args.task)
-    state.ledger_append("dispatched", session=meta["session"], name=args.name, cmd=cmd, task=args.task)
+    meta = workers.launch(args.name, cmd, state.home, task=args.task, judge_cmd=args.judge)
+    state.append_event(
+        "worker:dispatched", session=meta["session"], name=args.name, cmd=cmd, task=args.task, judge_cmd=args.judge
+    )
+    state.ledger_append(
+        "dispatched", session=meta["session"], name=args.name, cmd=cmd, task=args.task, judge_cmd=args.judge
+    )
     if as_json:
         print(json.dumps({**meta, "log": str(state.worker_log_path(meta["session"]))}, indent=2))
     else:
@@ -137,6 +146,7 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
         batch_window_s=args.batch_window,
         batch_max=args.batch_max,
         triage_every=triage_every,
+        judge_timeout_s=args.judge_timeout,
     )
     if supervisor.triage_runner is not None:
         if args.triage_bundle:
@@ -258,9 +268,121 @@ def _cmd_status(queue: PacketQueue, as_json: bool) -> int:
     return 0
 
 
+def _cmd_judge_verify(args: argparse.Namespace, as_json: bool) -> int:
+    """The broken-test protocol (context/judge-contract.md): a judge must PASS
+    the known-good artifact AND FAIL the deliberately broken one. A judge that
+    never fails is decoration — exit 0 ONLY when both directions behave."""
+    result = judge_verify(args.cmd, args.good, args.broken, timeout_s=args.timeout)
+    if as_json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.passed else 1
+    for direction, expectation in ((result.good, "expect exit 0"), (result.broken, "expect nonzero")):
+        code = "none (timeout/spawn failure)" if direction.exit_code is None else direction.exit_code
+        status = "ok" if direction.ok else "WRONG"
+        print(f"[{direction.direction}] {direction.artifact}")
+        print(f"  exit: {code} ({expectation}) -> {status}")
+        output = _truncate(direction.output, 200)
+        print(f"  output: {output or '(none)'}")
+    if result.passed:
+        print("VERDICT: PASS — judge passes the good artifact and fails the broken one")
+        return 0
+    problems = []
+    if not result.good.ok:
+        problems.append("judge did NOT pass the known-good artifact")
+    if not result.broken.ok:
+        problems.append("judge did NOT fail the broken artifact (a judge that never fails is decoration)")
+    print(f"VERDICT: FAIL — {'; '.join(problems)}")
+    return 1
+
+
+# -- ledger summary (the "what landed today" closure ritual) -----------------------
+
+
+def summarize_ledger(entries: list[dict]) -> dict:
+    """Reduce one day's ledger entries to the closure-ritual summary dict."""
+    import statistics
+
+    loops_closed = [e for e in entries if e.get("kind") == "loop_closed"]
+    loops_failed = [e for e in entries if e.get("kind") == "loop_failed"]
+    finished = [e for e in entries if e.get("kind") == "worker_finished"]
+    unjudged = [e for e in finished if not e.get("judged")]
+    created = [e for e in entries if e.get("kind") == "packet_created"]
+    answered = [e for e in entries if e.get("kind") == "packet_answered"]
+    latencies = [e["latency_s"] for e in answered if e.get("latency_s") is not None]
+    rules_applied = [e for e in entries if e.get("kind") == "rule_applied"]
+    batches = [e for e in entries if e.get("kind") == "notified_batch"]
+    return {
+        "loops_closed": [
+            {"session": e.get("session"), "name": e.get("name"), "worker_exit": e.get("worker_exit")}
+            for e in loops_closed
+        ],
+        "loops_failed": [
+            {"session": e.get("session"), "name": e.get("name"), "reason": e.get("reason")} for e in loops_failed
+        ],
+        "workers_finished_unjudged": [{"session": e.get("session"), "exit_code": e.get("exit_code")} for e in unjudged],
+        "packets_created": len(created),
+        "packets_answered": len(answered),
+        "answer_latency_median_s": round(statistics.median(latencies), 1) if latencies else None,
+        "rules_applied": [
+            {"proposal_id": e.get("proposal_id"), "section": e.get("section"), "sentence": e.get("sentence")}
+            for e in rules_applied
+        ],
+        "notification_batches": len(batches),
+    }
+
+
+def format_ledger_summary(summary: dict, date: str, path: str) -> str:
+    """Human-readable 'what landed today' rendering."""
+    lines = [f"What landed: {date}  ({path})", ""]
+
+    closed = summary["loops_closed"]
+    lines.append(f"Loops closed ({len(closed)}):")
+    for e in closed:
+        lines.append(f"  {e['session']}  (worker exit {e['worker_exit']})")
+    if not closed:
+        lines.append("  (none)")
+
+    failed = summary["loops_failed"]
+    lines.append(f"Loops failed ({len(failed)}):")
+    for e in failed:
+        lines.append(f"  {e['session']}  — {_truncate(e.get('reason') or '?', 70)}")
+    if not failed:
+        lines.append("  (none)")
+
+    unjudged = summary["workers_finished_unjudged"]
+    lines.append(f"Workers finished unjudged ({len(unjudged)}):")
+    for e in unjudged:
+        lines.append(f"  {e['session']}  (exit {e['exit_code']})")
+    if not unjudged:
+        lines.append("  (none)")
+
+    packets = f"Packets: {summary['packets_created']} created, {summary['packets_answered']} answered"
+    if summary["answer_latency_median_s"] is not None:
+        packets += f" (median latency {summary['answer_latency_median_s']}s)"
+    lines.append(packets)
+
+    rules = summary["rules_applied"]
+    lines.append(f"Rules applied ({len(rules)}):")
+    for e in rules:
+        lines.append(f"  [{e.get('section') or '?'}] {_truncate(e.get('sentence') or '?', 70)}")
+    if not rules:
+        lines.append("  (none)")
+
+    lines.append(f"Notification batches: {summary['notification_batches']}")
+    return "\n".join(lines)
+
+
 def _cmd_ledger(args: argparse.Namespace, as_json: bool) -> int:
     state = SupervisorState()
     entries = state.ledger_read(args.date)
+    if args.summary:
+        summary = summarize_ledger(entries)
+        if as_json:
+            print(json.dumps(summary, indent=2))
+            return 0
+        date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        print(format_ledger_summary(summary, date, str(state.ledger_path(args.date))))
+        return 0
     if as_json:
         print(json.dumps(entries, indent=2))
         return 0
@@ -295,6 +417,15 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_p.add_argument("--task", required=True, help="the task text for the worker")
     dispatch_p.add_argument("--bundle", default=None, help="bundle URI passed to 'amplifier run -B'")
     dispatch_p.add_argument("--worker-cmd", dest="worker_cmd", default=None, help="full command override")
+    dispatch_p.add_argument(
+        "--judge",
+        dest="judge",
+        default=None,
+        help=(
+            "judge command gating loop closure (context/judge-contract.md): run by the supervisor "
+            "when the worker finishes; exit 0 = loop:closed, nonzero = loop:failed"
+        ),
+    )
 
     supervise_p = sub.add_parser("supervise", help="run the supervisor tick loop (foreground)")
     supervise_p.add_argument("--interval", type=float, default=2.0, help="tick interval seconds (default 2)")
@@ -322,6 +453,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     supervise_p.add_argument(
         "--triage-timeout", dest="triage_timeout", type=float, default=None, help="per-session timeout seconds"
+    )
+    supervise_p.add_argument(
+        "--judge-timeout",
+        dest="judge_timeout",
+        type=float,
+        default=DEFAULT_JUDGE_TIMEOUT_S,
+        help=f"judge command timeout seconds (default {DEFAULT_JUDGE_TIMEOUT_S:.0f}); a timed-out judge is loop:failed",
+    )
+
+    judge_p = sub.add_parser("judge", help="judge utilities (context/judge-contract.md)")
+    judge_sub = judge_p.add_subparsers(dest="judge_command", required=True)
+    verify_p = judge_sub.add_parser(
+        "verify",
+        help="broken-test protocol: judge must PASS a good artifact AND FAIL a broken one",
+    )
+    verify_p.add_argument("--cmd", required=True, help="the judge command (run via bash -c with $ARTIFACT set)")
+    verify_p.add_argument("--good", required=True, help="path to a known-good artifact (judge must exit 0)")
+    verify_p.add_argument("--broken", required=True, help="path to a deliberately broken artifact (must exit nonzero)")
+    verify_p.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_JUDGE_TIMEOUT_S,
+        help=f"per-direction timeout seconds (default {DEFAULT_JUDGE_TIMEOUT_S:.0f})",
     )
 
     triage_p = sub.add_parser("triage", help="run one cold-triage pass (Phase 1: recommend + bounce + rule deltas)")
@@ -355,6 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ledger_p = sub.add_parser("ledger", help="show the daily ledger")
     ledger_p.add_argument("--date", default=None, help="YYYY-MM-DD (default: today UTC)")
+    ledger_p.add_argument(
+        "--summary",
+        action="store_true",
+        help="'what landed today' closure ritual: loops closed/failed, packets, rules, batches",
+    )
 
     return parser
 
@@ -380,6 +539,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_triage(args, args.json)
         if args.command == "rulebook":
             return _cmd_rulebook(args, args.json)
+        if args.command == "judge":
+            if args.judge_command == "verify":
+                return _cmd_judge_verify(args, args.json)
+            raise ValueError(f"unhandled judge command {args.judge_command!r}")  # pragma: no cover
         if args.command == "status":
             return _cmd_status(queue, args.json)
         if args.command == "ledger":
