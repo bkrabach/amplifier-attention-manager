@@ -16,7 +16,7 @@ for entry in (
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from attention_manager.queue import PacketQueue  # noqa: E402
+from attention_manager.queue import PacketQueue
 
 
 @pytest.fixture

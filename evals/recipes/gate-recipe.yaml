@@ -1,0 +1,42 @@
+# gate-recipe.yaml — MINIMAL staged recipe for eval scenario 9 (recipe-gate bridge).
+#
+# Purpose-built for the attention-manager eval harness: two trivial bash echo
+# steps with ONE approval gate between the stages. No LLM/agent steps — the
+# gate mechanics are what's under test, not recipe content.
+#
+# Provenance: the amplifier-bundle-recipes examples were surveyed first
+# (examples/dependency-upgrade-staged-recipe.yaml is the canonical staged
+# example) but every staged example there drives LLM agents (zen-architect,
+# integration-specialist) — not minimal/deterministic. This recipe follows the
+# same stages/approval schema (docs/RECIPE_SCHEMA.md: StageConfig +
+# ApprovalConfig) with bash steps instead.
+#
+# timeout: 0 on the gate = wait forever — the eval answers via the
+# attention-manager packet queue; the recipes tool must never auto-deny first.
+
+name: "eval-gate-recipe"
+description: "Minimal staged recipe with one approval gate between two trivial bash steps (attention-manager eval)"
+version: "1.0.0"
+tags: ["eval", "staged", "approval-gate", "attention-manager"]
+
+stages:
+  - name: "before-gate"
+    steps:
+      - id: "step-one"
+        type: "bash"
+        command: "echo stage-one-done"
+        output: "stage_one_output"
+        timeout: 30
+    approval:
+      required: true
+      prompt: "Eval gate: approve to run stage two?"
+      timeout: 0 # wait forever — the attention-manager bridge answers
+      default: "deny"
+
+  - name: "after-gate"
+    steps:
+      - id: "step-two"
+        type: "bash"
+        command: "echo stage-two-done"
+        output: "stage_two_output"
+        timeout: 30

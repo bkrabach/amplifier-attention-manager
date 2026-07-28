@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import json
 import secrets
-from dataclasses import dataclass
-from dataclasses import field
-from datetime import datetime
-from datetime import timezone
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -30,12 +28,12 @@ PERMISSION_OPTION_IDS = ("allow", "deny")
 
 def utc_now_iso() -> str:
     """Current UTC time as ISO-8601 with Z suffix, second precision."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def new_packet_id(now: datetime | None = None) -> str:
     """Sortable unique packet id: pkt-<UTC yyyymmdd-HHMMSS>-<4 hex>."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     return f"pkt-{now:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
 
 

@@ -4,15 +4,17 @@ from typing import Any
 
 import pytest
 
-from attention_manager.packet import MAX_CONTEXT_CHARS
-from attention_manager.packet import OnTimeout
-from attention_manager.packet import Option
-from attention_manager.packet import Packet
-from attention_manager.packet import Recommendation
-from attention_manager.packet import Resolution
-from attention_manager.packet import Source
-from attention_manager.packet import Urgency
-from attention_manager.packet import new_packet_id
+from attention_manager.packet import (
+    MAX_CONTEXT_CHARS,
+    OnTimeout,
+    Option,
+    Packet,
+    Recommendation,
+    Resolution,
+    Source,
+    Urgency,
+    new_packet_id,
+)
 
 
 def make_decision_packet(**overrides) -> Packet:

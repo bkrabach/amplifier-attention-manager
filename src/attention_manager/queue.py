@@ -4,8 +4,8 @@ Directory contract (authoritative doc: context/packet-schema.md):
 
     <root>/
       pending/    packets awaiting an answer
-      answered/   resolved packets (resolution filled)
-      auto/       Phase-2+ auto-answered packets (manager log)
+      answered/   resolved packets (resolution filled) — incl. Phase-2 auto-answers (canonical)
+      auto/       Phase-2 auto-answer REVIEW RECORDS (autolog.py — not packets)
       bounced/    malformed packets returned to producers
 
 Root resolution: ``$ATTENTION_QUEUE_DIR`` if set, else ``~/.amplifier/attention/queue``.
@@ -20,9 +20,7 @@ import os
 import time
 from pathlib import Path
 
-from .packet import Packet
-from .packet import Resolution
-from .packet import utc_now_iso
+from .packet import Packet, Resolution, utc_now_iso
 
 DEFAULT_QUEUE_DIR = "~/.amplifier/attention/queue"
 ENV_QUEUE_DIR = "ATTENTION_QUEUE_DIR"

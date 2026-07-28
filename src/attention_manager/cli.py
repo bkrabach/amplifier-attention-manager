@@ -14,6 +14,10 @@ Commands:
                                 [--judge-timeout N]
     attention-manager judge verify --cmd CMD --good PATH --broken PATH [--timeout N]
     attention-manager triage --once [--bundle URI] [--timeout N]
+    attention-manager auto list [--json]
+    attention-manager auto confirm <packet_id>
+    attention-manager auto reject <packet_id> --correct-option X --reason TEXT
+    attention-manager recipes poll --once [--bundle NAME] [--timeout N]
     attention-manager rulebook show
     attention-manager rulebook proposals [--json]
     attention-manager rulebook apply <id>
@@ -31,26 +35,25 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
-from datetime import timezone
+from datetime import UTC, datetime
 
-from . import workers
-from . import workunit
+from . import trust, workers, workunit
+from .autolog import AutoLog
 from .judge import DEFAULT_JUDGE_TIMEOUT_S
 from .judge import verify as judge_verify
 from .packet import Packet
 from .queue import PacketQueue
+from .recipe_gates import DEFAULT_TIMEOUT_S as RECIPES_DEFAULT_TIMEOUT_S
+from .recipe_gates import RecipeGatePoller
 from .rulebook import Rulebook
 from .state import SupervisorState
-from .supervisor import DEFAULT_TRIAGE_EVERY_TICKS
-from .supervisor import Supervisor
-from .triage import DEFAULT_TIMEOUT_S
-from .triage import TriageRunner
+from .supervisor import DEFAULT_RECIPES_EVERY_TICKS, DEFAULT_TRIAGE_EVERY_TICKS, Supervisor
+from .triage import DEFAULT_TIMEOUT_S, TriageRunner
 
 
 def _parse_iso(ts: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)  # 3.11+ accepts the 'Z' suffix natively
     except ValueError:
         return None
 
@@ -59,7 +62,7 @@ def _age(created_at: str) -> str:
     created = _parse_iso(created_at)
     if created is None:
         return "?"
-    seconds = max(0, int((datetime.now(timezone.utc) - created).total_seconds()))
+    seconds = max(0, int((datetime.now(UTC) - created).total_seconds()))
     if seconds < 60:
         return f"{seconds}s"
     if seconds < 3600:
@@ -142,12 +145,14 @@ def _cmd_dispatch(args: argparse.Namespace, as_json: bool) -> int:
 def _cmd_supervise(args: argparse.Namespace) -> int:
     notify_spec = args.notify or os.environ.get("ATTENTION_NOTIFY") or None
     triage_every = args.triage_every if args.triage else None
+    recipes_every = args.recipes_every if args.recipes else None
     supervisor = Supervisor(
         notify_spec=notify_spec,
         interval_s=args.interval,
         batch_window_s=args.batch_window,
         batch_max=args.batch_max,
         triage_every=triage_every,
+        recipes_every=recipes_every,
         judge_timeout_s=args.judge_timeout,
     )
     if supervisor.triage_runner is not None:
@@ -172,6 +177,111 @@ def _cmd_triage(args: argparse.Namespace, as_json: bool) -> int:
         print(f"{o.packet_id}  {o.phase:<10} {o.outcome:<12} {_truncate(o.detail, 80)}")
     errors = sum(1 for o in outcomes if o.outcome == "error")
     print(f"triage pass: {len(outcomes)} packet(s) processed, {errors} error(s)")
+    return 0
+
+
+def _cmd_auto(args: argparse.Namespace, queue: PacketQueue, as_json: bool) -> int:
+    """The Phase-2 calibration loop over queue/auto/ review records.
+
+    HONESTY NOTE (also in the record format doc): reviewing an auto-answer is
+    CALIBRATION ONLY. The producing worker already unblocked the moment the
+    auto answer landed in answered/ — `auto reject` cannot un-answer it. A
+    rejection records the correction and DEMOTES the cited rulebook sections
+    to Phase 1 (streak 0) so the same class stops being auto-answered.
+    """
+    autolog = AutoLog(queue.root)
+    if args.auto_command == "list":
+        records = autolog.list_records(include_reviewed=False)
+        if as_json:
+            print(json.dumps(records, indent=2))
+            return 0
+        if not records:
+            print(f"no unreviewed auto-answer records ({autolog.dir()})")
+            return 0
+        header = f"{'PACKET':<26} {'ANSWER':<8} {'SECTIONS':<28} WHY / RULES"
+        print(header)
+        print("-" * len(header))
+        for r in records:
+            detail = f"{r.get('why', '')} | rules: {', '.join(r.get('rule_refs') or [])}"
+            print(
+                f"{r['packet_id']:<26} {r.get('answer', '?'):<8} "
+                f"{_truncate(', '.join(r.get('sections') or []), 28):<28} {_truncate(detail, 60)}"
+            )
+        return 0
+
+    state = SupervisorState()
+    rulebook = Rulebook()
+    if args.auto_command == "confirm":
+        record = autolog.mark_confirmed(args.packet_id)
+        outcomes = trust.record_match(
+            rulebook, state, args.packet_id, list(record.get("sections") or []), source="auto-confirm"
+        )
+        state.append_event("auto:confirmed", packet_id=args.packet_id, sections=record.get("sections"))
+        state.ledger_append("auto_confirmed", packet_id=args.packet_id, sections=record.get("sections"))
+        if as_json:
+            print(json.dumps({"record": record, "trust": outcomes}, indent=2))
+            return 0
+        print(f"confirmed {args.packet_id}: auto answer {record.get('answer')!r} was right")
+        for o in outcomes:
+            note = " — PROMOTED to phase 2" if o["promoted"] else ""
+            print(f"  trust: {o['section']} phase {o['phase']} streak {o['streak']}{note}")
+        return 0
+
+    if args.auto_command == "reject":
+        # Validate the correction against the packet's declared options — a
+        # correction naming a non-existent option is calibration garbage.
+        packet = queue.get(args.packet_id)
+        if args.correct_option not in packet.option_ids():
+            raise ValueError(
+                f"--correct-option {args.correct_option!r} is not one of packet "
+                f"{args.packet_id!r} options {packet.option_ids()}"
+            )
+        record = autolog.mark_rejected(args.packet_id, args.correct_option, args.reason)
+        outcomes = trust.record_override(
+            rulebook, state, args.packet_id, list(record.get("sections") or []), source="auto-reject"
+        )
+        state.append_event(
+            "auto:rejected",
+            packet_id=args.packet_id,
+            correct_option=args.correct_option,
+            reason=args.reason,
+            sections=record.get("sections"),
+        )
+        state.ledger_append(
+            "auto_rejected", packet_id=args.packet_id, correct_option=args.correct_option, reason=args.reason
+        )
+        if as_json:
+            print(json.dumps({"record": record, "trust": outcomes}, indent=2))
+            return 0
+        print(
+            f"rejected {args.packet_id}: correction recorded (correct option {args.correct_option!r}). "
+            f"NOTE: calibration only — the worker already unblocked on the auto answer; this cannot un-answer it."
+        )
+        for o in outcomes:
+            print(f"  trust: {o['section']} DEMOTED to phase {o['phase']}, streak {o['streak']}")
+        return 0
+    raise ValueError(f"unhandled auto command {args.auto_command!r}")  # pragma: no cover
+
+
+def _cmd_recipes(args: argparse.Namespace, queue: PacketQueue, as_json: bool) -> int:
+    poller = RecipeGatePoller(queue=queue, bundle=args.bundle, timeout_s=args.timeout)
+    poller.preflight()  # fail loud upfront if the amplifier binary is missing
+    results = poller.poll_once()
+    if as_json:
+        print(json.dumps(results, indent=2))
+        return 0
+    if not results:
+        print("recipes poll: nothing to do (no new pending gates, no answered gate packets)")
+        return 0
+    for r in results:
+        if r["action"] == "packetized":
+            print(f"packetized {r['gate']} -> {r['packet_id']}")
+        elif r["action"] == "resolved":
+            print(f"resolved {r['gate']}: {r['answer']} forwarded to the recipes tool ({r['packet_id']})")
+        else:
+            print(f"ERROR {r.get('gate', r.get('phase', '?'))}: {r['error']}")
+    errors = sum(1 for r in results if r["action"] == "error")
+    print(f"recipes poll: {len(results)} action(s), {errors} error(s)")
     return 0
 
 
@@ -382,7 +492,7 @@ def _cmd_ledger(args: argparse.Namespace, as_json: bool) -> int:
         if as_json:
             print(json.dumps(summary, indent=2))
             return 0
-        date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date = args.date or datetime.now(UTC).strftime("%Y-%m-%d")
         print(format_ledger_summary(summary, date, str(state.ledger_path(args.date))))
         return 0
     if as_json:
@@ -457,6 +567,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--triage-timeout", dest="triage_timeout", type=float, default=None, help="per-session timeout seconds"
     )
     supervise_p.add_argument(
+        "--recipes",
+        action="store_true",
+        help="poll recipes approval gates into packets every N ticks (producer #4; default off)",
+    )
+    supervise_p.add_argument(
+        "--recipes-every",
+        dest="recipes_every",
+        type=int,
+        default=DEFAULT_RECIPES_EVERY_TICKS,
+        help=f"ticks between recipe-gate polls when --recipes is set (default {DEFAULT_RECIPES_EVERY_TICKS})",
+    )
+    supervise_p.add_argument(
         "--judge-timeout",
         dest="judge_timeout",
         type=float,
@@ -495,6 +617,53 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TIMEOUT_S,
         help=f"per-session timeout seconds (default {DEFAULT_TIMEOUT_S:.0f})",
+    )
+
+    auto_p = sub.add_parser(
+        "auto",
+        help=(
+            "review Phase-2 auto-answers (queue/auto/). Calibration only: a rejection records the "
+            "correction and demotes trust — it CANNOT un-answer the packet (the worker already unblocked)."
+        ),
+    )
+    auto_sub = auto_p.add_subparsers(dest="auto_command", required=True)
+    auto_sub.add_parser("list", help="list unreviewed auto-answer records (why + cited rules)")
+    auto_confirm_p = auto_sub.add_parser(
+        "confirm", help="confirm an auto-answer was right (counts as a match; may promote sections)"
+    )
+    auto_confirm_p.add_argument("packet_id")
+    auto_reject_p = auto_sub.add_parser(
+        "reject",
+        help=(
+            "reject an auto-answer: records the correction and DEMOTES the cited sections to phase 1 "
+            "(streak 0). Calibration only — cannot un-answer the already-unblocked worker."
+        ),
+    )
+    auto_reject_p.add_argument("packet_id")
+    auto_reject_p.add_argument(
+        "--correct-option", dest="correct_option", required=True, help="the option the human would have chosen"
+    )
+    auto_reject_p.add_argument("--reason", required=True, help="why the auto answer was wrong (calibration data)")
+
+    recipes_p = sub.add_parser(
+        "recipes", help="recipe approval-gate bridge (producer #4): polls `amplifier tool invoke recipes`"
+    )
+    recipes_sub = recipes_p.add_subparsers(dest="recipes_command", required=True)
+    recipes_poll_p = recipes_sub.add_parser(
+        "poll", help="one poll: packetize new pending gates, forward answered gate packets"
+    )
+    recipes_poll_p.add_argument(
+        "--once",
+        action="store_true",
+        required=True,
+        help="required: run exactly one poll (continuous polling runs inside 'supervise --recipes')",
+    )
+    recipes_poll_p.add_argument("--bundle", default=None, help="bundle passed to 'amplifier tool invoke -b'")
+    recipes_poll_p.add_argument(
+        "--timeout",
+        type=float,
+        default=RECIPES_DEFAULT_TIMEOUT_S,
+        help=f"per-invoke timeout seconds (default {RECIPES_DEFAULT_TIMEOUT_S:.0f})",
     )
 
     rulebook_p = sub.add_parser("rulebook", help="show the rulebook and manage rule proposals")
@@ -557,6 +726,12 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_supervise(args)
         if args.command == "triage":
             return _cmd_triage(args, args.json)
+        if args.command == "auto":
+            return _cmd_auto(args, queue, args.json)
+        if args.command == "recipes":
+            if args.recipes_command == "poll":
+                return _cmd_recipes(args, queue, args.json)
+            raise ValueError(f"unhandled recipes command {args.recipes_command!r}")  # pragma: no cover
         if args.command == "rulebook":
             return _cmd_rulebook(args, args.json)
         if args.command == "judge":

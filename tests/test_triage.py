@@ -12,16 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from attention_manager.packet import Option
-from attention_manager.packet import Packet
-from attention_manager.packet import Recommendation
-from attention_manager.packet import Source
+from attention_manager.packet import Option, Packet, Recommendation, Source
 from attention_manager.queue import PacketQueue
 from attention_manager.rulebook import Rulebook
 from attention_manager.state import SupervisorState
-from attention_manager.triage import TriageRunner
-from attention_manager.triage import build_rule_delta_prompt
-from attention_manager.triage import build_triage_prompt
+from attention_manager.triage import TriageRunner, build_rule_delta_prompt, build_triage_prompt
 
 # The fake amplifier CLI. Accepts `run -B <bundle> <prompt>`, greps the prompt
 # header, writes a canned verdict per FAKE_TRIAGE_MODE / FAKE_DELTA_MODE.
@@ -445,7 +440,7 @@ class TestSupervisorTriageWiring:
             queue=queue,
             triage_every=2,
             triage_runner=runner,
-            list_sessions=lambda: [],
+            list_sessions=list,
             observe=_no_observation,
         )
 
@@ -472,7 +467,7 @@ class TestSupervisorTriageWiring:
             queue=PacketQueue(queue_root),
             triage_every=1,
             triage_runner=boom,
-            list_sessions=lambda: [],
+            list_sessions=list,
             observe=_no_observation,
         )
         supervisor.tick()  # must not raise

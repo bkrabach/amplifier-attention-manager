@@ -25,9 +25,8 @@ import time
 from pathlib import Path
 
 import pytest
-from attention_manager.packet import Option
-from attention_manager.packet import Packet
-from attention_manager.packet import Source
+
+from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
 from attention_manager.supervisor import Supervisor
 from attention_manager.workers import Observation
@@ -67,7 +66,7 @@ def make_supervisor(home, queue, **kwargs) -> Supervisor:
     return Supervisor(
         home=home,
         queue=queue,
-        list_sessions=lambda: [],
+        list_sessions=list,
         observe=lambda session, log: Observation(alive=True, exit_code=None, sentinel_seen=False, session_id=None),
         **kwargs,
     )

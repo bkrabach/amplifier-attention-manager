@@ -9,13 +9,15 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from amplifier_core import ApprovalRequest
-from amplifier_module_hooks_packet_approval import APPROVAL_REGISTER_CAPABILITY
-from amplifier_module_hooks_packet_approval import GATE_POLICY_PRIORITY
-from amplifier_module_hooks_packet_approval import PROVIDER_CAPABILITY
-from amplifier_module_hooks_packet_approval import REQUIRE_APPROVAL_STATE_KEY
-from amplifier_module_hooks_packet_approval import PacketApprovalProvider
-from amplifier_module_hooks_packet_approval import mount
-from amplifier_module_hooks_packet_approval import on_session_ready
+from amplifier_module_hooks_packet_approval import (
+    APPROVAL_REGISTER_CAPABILITY,
+    GATE_POLICY_PRIORITY,
+    PROVIDER_CAPABILITY,
+    REQUIRE_APPROVAL_STATE_KEY,
+    PacketApprovalProvider,
+    mount,
+    on_session_ready,
+)
 
 from attention_manager.queue import PacketQueue
 

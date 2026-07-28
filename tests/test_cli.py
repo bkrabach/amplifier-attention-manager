@@ -3,9 +3,7 @@
 import json
 
 from attention_manager.cli import main
-from attention_manager.packet import Option
-from attention_manager.packet import Packet
-from attention_manager.packet import Source
+from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
 
 

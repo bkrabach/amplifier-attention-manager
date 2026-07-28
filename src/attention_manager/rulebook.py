@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
-from datetime import datetime
-from datetime import timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,86 @@ RULEBOOK_FILENAME = "rulebook.md"
 PROPOSALS_FILENAME = "rulebook-proposals.jsonl"
 
 DEFAULT_TOKEN_CAP = 2000
+
+# Graduated-trust promotion state (design §Triage). Phase/streak live ONLY in
+# the section heading annotation — visible, auditable, never in memory:
+#     ## Auto-answer rules <!-- phase:2 streak:3 -->
+# No annotation = the defaults (phase 1, streak 0).
+DEFAULT_PHASE = 1
+DEFAULT_STREAK = 0
+VALID_PHASES = (1, 2, 3)  # design ladder; step-6 promotion logic only uses 1→2
+
+_HEADING_RE = re.compile(r"^##\s+(?P<name>.+?)(?:\s*<!--\s*phase:(?P<phase>\d+)\s+streak:(?P<streak>\d+)\s*-->)?\s*$")
+
+
+def parse_section_heading(line: str) -> tuple[str, int, int] | None:
+    """Parse a ``## Section <!-- phase:P streak:S -->`` line.
+
+    Returns (section name, phase, streak) — defaults (1, 0) when the heading
+    carries no annotation — or None if the line is not a ``##`` heading.
+    """
+    if not line.startswith("## "):
+        return None
+    match = _HEADING_RE.match(line)
+    if match is None:  # pragma: no cover — the regex accepts any '## x' line
+        return None
+    phase = int(match.group("phase")) if match.group("phase") else DEFAULT_PHASE
+    streak = int(match.group("streak")) if match.group("streak") else DEFAULT_STREAK
+    return match.group("name"), phase, streak
+
+
+def format_section_heading(section: str, phase: int, streak: int) -> str:
+    return f"## {section} <!-- phase:{phase} streak:{streak} -->"
+
+
+def section_bodies(content: str) -> dict[str, str]:
+    """Split rulebook content into {section name: body text} (annotation-tolerant)."""
+    lines_for: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in content.splitlines():
+        parsed = parse_section_heading(line.strip())
+        if parsed is not None:
+            current = parsed[0]
+            lines_for[current] = []
+            continue
+        if current is not None:
+            lines_for[current].append(line)
+    return {section: "\n".join(lines) for section, lines in lines_for.items()}
+
+
+def resolve_ref(content: str, ref: str) -> str | None:
+    """Map one triage ``rule_ref`` to the rulebook section containing it.
+
+    rule_refs may be section names or rule-text snippets. Resolution order
+    (conservative — never guess; a wrong mapping would corrupt the trust
+    ladder):
+
+    1. Exact section-name match (case-insensitive).
+    2. Section-name prefix followed by a non-word character
+       (e.g. ``"Auto-answer rules: prefer shims"`` or ``"Edge cases §2"``).
+    3. The ref text appears verbatim in exactly ONE section's body.
+
+    Returns None when unresolvable.
+    """
+    ref_clean = ref.strip()
+    if not ref_clean:
+        return None
+    lowered = ref_clean.lower()
+
+    for section in SECTIONS:
+        if lowered == section.lower():
+            return section
+
+    for section in SECTIONS:
+        prefix = section.lower()
+        if lowered.startswith(prefix) and len(lowered) > len(prefix) and not lowered[len(prefix)].isalnum():
+            return section
+
+    matches = [section for section, body in section_bodies(content).items() if ref_clean in body]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
 
 # The design's five sections, in canonical order (§Rulebook Contract).
 SECTIONS = (
@@ -84,7 +164,7 @@ def approx_tokens(text: str) -> int:
 
 def new_proposal_id(now: datetime | None = None) -> str:
     """Sortable unique proposal id: rp-<UTC yyyymmdd-HHMMSS>-<4 hex>."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     return f"rp-{now:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
 
 
@@ -145,11 +225,18 @@ class Rulebook:
         _write_atomic(self.path, new_content)
 
     @staticmethod
-    def _insert_into_section(content: str, section: str, bullet: str) -> str:
-        """Insert a bullet line at the end of ``## <section>`` (before the next ##)."""
-        lines = content.splitlines()
-        heading = f"## {section}"
-        start = next((i for i, line in enumerate(lines) if line.strip() == heading), None)
+    def _section_bounds(lines: list[str], section: str) -> tuple[int, int]:
+        """Return (heading line index, exclusive end index) for ``## <section>``.
+
+        Tolerates the graduated-trust heading annotation (``<!-- phase:P
+        streak:S -->``). Raises ValueError if the heading is missing.
+        """
+        start = None
+        for i, line in enumerate(lines):
+            parsed = parse_section_heading(line.strip())
+            if parsed is not None and parsed[0] == section:
+                start = i
+                break
         if start is None:
             raise ValueError(f"rulebook at hand has no '## {section}' heading — file was edited out of shape")
         end = len(lines)
@@ -157,14 +244,69 @@ class Rulebook:
             if lines[i].startswith("## "):
                 end = i
                 break
+        return start, end
+
+    @classmethod
+    def _insert_into_section(cls, content: str, section: str, bullet: str) -> str:
+        """Insert a bullet line at the end of ``## <section>`` (before the next ##)."""
+        lines = content.splitlines()
+        start, end = cls._section_bounds(lines, section)
         # Trim trailing blank lines inside the section, append bullet + blank.
         insert_at = end
         while insert_at > start + 1 and not lines[insert_at - 1].strip():
             insert_at -= 1
-        new_lines = lines[:insert_at] + [bullet] + [""] + lines[insert_at:end] + lines[end:]
         # lines[insert_at:end] is only trailing blanks; drop them to avoid growth.
         new_lines = lines[:insert_at] + [bullet, ""] + lines[end:]
         return "\n".join(new_lines) + ("\n" if content.endswith("\n") else "")
+
+    # -- graduated-trust section state (design §Triage, Phase 2) -----------------
+    #
+    # Promotion state lives ONLY in the rulebook file (never in memory): a
+    # visible, auditable annotation on the section heading. Every read parses
+    # the file fresh; every write is an atomic full-file rewrite.
+
+    def get_section_state(self, section: str) -> tuple[int, int]:
+        """Return (phase, streak) for a section. Defaults: (1, 0)."""
+        if section not in SECTIONS:
+            raise ValueError(f"unknown rulebook section {section!r}; expected one of {list(SECTIONS)}")
+        content, _ = self.read()
+        lines = content.splitlines()
+        start, _ = self._section_bounds(lines, section)
+        parsed = parse_section_heading(lines[start].strip())
+        assert parsed is not None  # _section_bounds found it via the same parser
+        return parsed[1], parsed[2]
+
+    def set_section_state(self, section: str, phase: int, streak: int) -> None:
+        """Rewrite a section heading's ``<!-- phase:P streak:S -->`` annotation."""
+        if section not in SECTIONS:
+            raise ValueError(f"unknown rulebook section {section!r}; expected one of {list(SECTIONS)}")
+        if phase not in VALID_PHASES:
+            raise ValueError(f"phase {phase!r} not in {VALID_PHASES}")
+        if not isinstance(streak, int) or streak < 0:
+            raise ValueError(f"streak must be a non-negative integer, got {streak!r}")
+        content, _ = self.read()
+        lines = content.splitlines()
+        start, _ = self._section_bounds(lines, section)
+        lines[start] = format_section_heading(section, phase, streak)
+        self._write_atomic_rulebook("\n".join(lines) + ("\n" if content.endswith("\n") else ""))
+
+    def _write_atomic_rulebook(self, content: str) -> None:
+        _write_atomic(self.path, content)
+
+    def resolve_ref_to_section(self, ref: str) -> str | None:
+        """Map a triage ``rule_ref`` (section name or rule-text snippet) to a section.
+
+        Resolution order (conservative — never guess):
+        1. Exact section-name match (case-insensitive).
+        2. ``<section name>`` prefix followed by a non-word boundary
+           (e.g. ``"Auto-answer rules: prefer shims"`` or ``"Edge cases §2"``).
+        3. The ref appears verbatim in exactly ONE section's body.
+
+        Returns None when unresolvable (caller must skip, loudly — mapping a
+        ref to the wrong section would corrupt the trust ladder).
+        """
+        content, _ = self.read()
+        return resolve_ref(content, ref)
 
     # -- proposals -------------------------------------------------------------
 

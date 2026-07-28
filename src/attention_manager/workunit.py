@@ -37,8 +37,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .attractor_gate import PacketInterviewer
-from .attractor_gate import import_loop_pipeline
+from .attractor_gate import PacketInterviewer, import_loop_pipeline
 from .queue import PacketQueue
 from .state import SupervisorState
 

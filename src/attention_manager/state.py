@@ -40,8 +40,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable
-from datetime import datetime
-from datetime import timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +60,7 @@ def default_home() -> Path:
 
 def utc_today() -> str:
     """Today's date (UTC) as YYYY-MM-DD — the ledger file key."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
 def _write_atomic(path: Path, text: str) -> None:

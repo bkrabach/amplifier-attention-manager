@@ -14,15 +14,12 @@ import sys
 import threading
 import time
 import types
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
-from attention_manager.attractor_gate import INSTALL_HINT
-from attention_manager.attractor_gate import PacketInterviewer
-from attention_manager.attractor_gate import import_loop_pipeline
+from attention_manager.attractor_gate import INSTALL_HINT, PacketInterviewer, import_loop_pipeline
 from attention_manager.queue import PacketQueue
 
 # -- stub loop-pipeline -------------------------------------------------------
@@ -74,11 +71,11 @@ def stub_lp(monkeypatch) -> types.ModuleType:
     pkg = types.ModuleType("amplifier_module_loop_pipeline")
     pkg.__path__ = []  # mark as package so submodule imports resolve via sys.modules
     interviewer = types.ModuleType("amplifier_module_loop_pipeline.interviewer")
-    setattr(interviewer, "QuestionType", StubQuestionType)
-    setattr(interviewer, "Option", StubOption)
-    setattr(interviewer, "Question", StubQuestion)
-    setattr(interviewer, "Answer", StubAnswer)
-    setattr(pkg, "interviewer", interviewer)
+    interviewer.QuestionType = StubQuestionType  # type: ignore[attr-defined]
+    interviewer.Option = StubOption  # type: ignore[attr-defined]
+    interviewer.Question = StubQuestion  # type: ignore[attr-defined]
+    interviewer.Answer = StubAnswer  # type: ignore[attr-defined]
+    pkg.interviewer = interviewer  # type: ignore[attr-defined]
     _purge_lp_modules(monkeypatch)
     monkeypatch.setitem(sys.modules, "amplifier_module_loop_pipeline", pkg)
     monkeypatch.setitem(sys.modules, "amplifier_module_loop_pipeline.interviewer", interviewer)

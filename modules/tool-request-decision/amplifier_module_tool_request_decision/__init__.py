@@ -83,7 +83,7 @@ def _read_resolution(root: Path, packet_id: str) -> dict[str, Any] | None:
 
 
 def _parse_deadline(deadline: str) -> datetime:
-    return datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+    return datetime.fromisoformat(deadline)  # 3.11+ accepts the 'Z' suffix natively
 
 
 # -- input validation ----------------------------------------------------------

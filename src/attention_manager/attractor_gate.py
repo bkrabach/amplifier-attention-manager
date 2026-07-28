@@ -37,18 +37,11 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Callable
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
+from datetime import UTC, datetime, timedelta
 from types import ModuleType
 from typing import Any
 
-from .packet import OnTimeout
-from .packet import Option
-from .packet import Packet
-from .packet import Resolution
-from .packet import Source
-from .packet import Urgency
+from .packet import OnTimeout, Option, Packet, Resolution, Source, Urgency
 from .queue import PacketQueue
 
 logger = logging.getLogger(__name__)
@@ -167,7 +160,7 @@ class PacketInterviewer:
         urgency = Urgency()
         timeout_seconds = getattr(question, "timeout_seconds", None)
         if timeout_seconds is not None:
-            deadline = datetime.now(timezone.utc) + timedelta(seconds=float(timeout_seconds))
+            deadline = datetime.now(UTC) + timedelta(seconds=float(timeout_seconds))
             urgency = Urgency(
                 tier="batch",
                 deadline=deadline.replace(microsecond=0).isoformat().replace("+00:00", "Z"),

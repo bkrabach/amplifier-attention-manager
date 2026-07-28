@@ -6,9 +6,7 @@ from typing import Any
 
 import pytest
 
-from attention_manager.packet import Option
-from attention_manager.packet import Packet
-from attention_manager.packet import Source
+from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
 
 

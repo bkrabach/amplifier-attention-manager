@@ -17,7 +17,7 @@ Schema version: **1**. Any breaking change to this contract bumps
 <root>/                 # $ATTENTION_QUEUE_DIR, else ~/.amplifier/attention/queue
 ├── pending/            # packets awaiting an answer
 ├── answered/           # resolved packets (resolution filled) — authoritative once present
-├── auto/               # Phase-2+ manager auto-answer log (human calibration review)
+├── auto/               # Phase-2 auto-answer REVIEW RECORDS (not packets — see below)
 └── bounced/            # malformed packets returned to producers (failed cold-reader test)
 ```
 
@@ -37,13 +37,19 @@ packet must never be observable under its final name.
 
 1. Producer writes packet to `pending/<id>.json` (atomic), then polls
    `answered/<id>.json` (poll interval ~1s).
-2. Answerer (CLI `attention-manager answer`, or the manager) validates that the
-   chosen option is one of the packet's declared `options` ids, fills
-   `resolution`, writes the resolved packet to `answered/<id>.json` (atomic),
-   then removes `pending/<id>.json`.
+2. Answerer (CLI `attention-manager answer`, the manager, or — Phase 2 — the
+   manager's auto-answer path) validates that the chosen option is one of the
+   packet's declared `options` ids, fills `resolution`, writes the resolved
+   packet to `answered/<id>.json` (atomic), then removes `pending/<id>.json`.
    - A crash between the two steps leaves both files present; **`answered/` is
      authoritative** whenever it exists.
 3. Producer sees `answered/<id>.json`, reads `resolution`, unblocks.
+
+**`answered/` is canonical for auto-answered packets too.** A Phase-2
+auto-answer moves the full packet `pending/` → `answered/` exactly like a
+human answer — that answered/ copy is the ONLY thing producers poll and
+unblock on. `auto/` holds a separate REVIEW RECORD (below), never the packet;
+nothing about unblocking depends on `auto/`.
 
 Fail-loud (design decision D7): nothing ever fabricates a resolution. Timeouts
 either apply an option **explicitly declared** in `urgency.on_timeout` (marked
@@ -122,7 +128,8 @@ pending.
     "answer": "B",
     // OPTIONAL.
     "rationale": "downstream owners unavailable",
-    // REQUIRED. "human" | "manager" | "timeout-default".
+    // REQUIRED. "human" | "manager" | "manager-auto" | "timeout-default".
+    // "manager-auto" marks a Phase-2 auto-answer (review record in auto/).
     "answered_by": "human",
     // REQUIRED. ISO-8601 UTC.
     "answered_at": "2026-07-26T17:00:00Z"

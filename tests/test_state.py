@@ -5,10 +5,8 @@ import json
 from pathlib import Path
 
 import pytest
-from attention_manager.state import SupervisorState
-from attention_manager.state import default_home
-from attention_manager.state import new_worker_record
-from attention_manager.state import utc_today
+
+from attention_manager.state import SupervisorState, default_home, new_worker_record, utc_today
 
 
 @pytest.fixture

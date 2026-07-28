@@ -4,12 +4,8 @@ retry-on-sink-failure)."""
 import json
 
 import pytest
-from attention_manager.notify import BatchItem
-from attention_manager.notify import ConsoleSink
-from attention_manager.notify import FileSink
-from attention_manager.notify import NotificationBatcher
-from attention_manager.notify import NtfySink
-from attention_manager.notify import parse_sink
+
+from attention_manager.notify import BatchItem, ConsoleSink, FileSink, NotificationBatcher, NtfySink, parse_sink
 
 
 class FakeClock:

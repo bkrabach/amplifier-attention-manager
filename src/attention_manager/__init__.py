@@ -4,8 +4,7 @@ Step 1 scope: packet model, disk queue, CLI. The on-disk packet file format is
 the contract; it is documented authoritatively in ``context/packet-schema.md``.
 """
 
-from .packet import Packet
-from .packet import Resolution
+from .packet import Packet, Resolution
 from .queue import PacketQueue
 
 __all__ = ["Packet", "PacketQueue", "Resolution"]

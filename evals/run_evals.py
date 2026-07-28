@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""attention-manager evaluation harness (build steps 1-5).
+"""attention-manager evaluation harness (build steps 1-6).
 
 Runs the scenarios in evals/scenarios/ INSIDE an already-running DTU
 (or any environment reachable via an exec command prefix):
@@ -39,10 +39,8 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
-from dataclasses import field
-from datetime import datetime
-from datetime import timezone
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -329,6 +327,105 @@ S7_ASSERTION_NAMES = [
     "ledger-workunit-finished",
 ]
 
+# -- scenario 8 (graduated trust auto-answer) constants -------------------------------
+
+S8_TIMEOUT_S = 600.0  # one real-LLM triage pass over 2 packets (+retries)
+S8_PROMOTED_HEADING = "## Auto-answer rules <!-- phase:2 streak:5 -->"
+S8_DEMOTED_HEADING = "## Auto-answer rules <!-- phase:1 streak:0 -->"
+S8_RULE_IMPLIED_OPTION = "B"  # staged rollout — the seed rule prefers lower operational risk
+
+# The S5 rulebook with the Auto-answer rules section PRE-PROMOTED to Phase 2
+# (streak 5) via the heading annotation (rulebook.py _HEADING_RE format). The
+# streak-walk to promotion is proven deterministically by local_trust_smoke.sh;
+# this scenario spends its LLM budget on the auto-answer bounds themselves.
+S8_RULEBOOK_CONTENT = S5_RULEBOOK_CONTENT.replace("## Auto-answer rules", S8_PROMOTED_HEADING, 1)
+
+# P1 = S5-style rule-covered rollout decision (auto-answer expected).
+# P2 = decidable-cold control NOT covered by any rulebook rule (its decision
+# basis is stated IN the packet), so it must stay Phase-1 recommend-only.
+S8_SEED_PACKETS_SCRIPT = """\
+from attention_manager.packet import Option, Packet, Source
+from attention_manager.queue import PacketQueue
+
+q = PacketQueue()
+p1 = Packet(
+    question="Choose rollout strategy for the config change",
+    options=[
+        Option(id="A", label="big-bang rollout", consequence="faster but riskier"),
+        Option(id="B", label="staged rollout", consequence="slower, lower operational risk"),
+    ],
+    source=Source(kind="decision"),
+    context=(
+        "The change updates the config parser. Downstream consumers auto-reload config. "
+        "A big-bang rollout completes in one deploy, but a regression would hit all "
+        "consumers at once. A staged rollout takes three deploys over two days with "
+        "canary checks at each stage. There is no deadline pressure this week, and "
+        "confidence in the change itself is equal between the two options."
+    ),
+)
+p2 = Packet(
+    question="Choose a name for the internal test fixture",
+    options=[
+        Option(id="fixture-a", label="fixture-a", consequence="shorter, matches existing fixture names"),
+        Option(id="fixture-b", label="fixture-b", consequence="slightly longer, equally descriptive"),
+    ],
+    source=Source(kind="decision"),
+    context=(
+        "A new internal test fixture needs a name. Existing fixtures in this test suite "
+        "follow the shortest-distinctive-name convention. Both candidates are otherwise "
+        "equivalent; nothing else depends on the choice."
+    ),
+)
+q.write(p1)
+q.write(p2)
+print(p1.id)
+print(p2.id)
+"""
+
+S8_ASSERTION_NAMES = [
+    "rulebook-seeded-prepromoted",
+    "packets-seeded",
+    "triage-pass-ok",
+    "p1-auto-answered",
+    "p1-auto-record",
+    "events-ledger-auto",
+    "p2-not-auto-answered",
+    "auto-reject-accepted",
+    "auto-record-reviewed",
+    "section-demoted",
+    "event-trust-demoted",
+]
+
+# -- scenario 9 (recipe-gate bridge) constants -----------------------------------------
+
+S9_TIMEOUT_S = 600.0  # deterministic recipe, but each amplifier invoke carries bundle-prep latency
+S9_INVOKE_TIMEOUT_S = 240.0  # local budget per in-DTU amplifier/poll exec
+S9_COMPLETE_WAIT_S = 120.0  # budget for the auto-resumed recipe to complete (list polling)
+S9_RECIPE_REL = "evals/recipes/gate-recipe.yaml"
+S9_STAGE_NAME = "before-gate"  # the gate stage in gate-recipe.yaml
+S9_FINAL_STEP = "step-two"  # the after-gate step: completion == this appears in completed_steps
+# Completion surface (verified against the real recipes tool locally):
+# operation=list -> {'sessions': [{'session_id', 'recipe_name', 'started',
+# 'current_step_index', 'completed_steps': [...]}], 'count': N} — NO status
+# field; for gate-recipe.yaml, completion == "step-two" in completed_steps.
+
+# Markers proving the recipes tool is unavailable in the DTU's default bundle
+# (honest env failure — graded could-not-evaluate with output captured, same
+# pattern as S7's missing-extra handling).
+S9_TOOL_MISSING_MARKERS = ("Tool 'recipes' not found", "tool-recipes", "not found in prepared bundle")
+
+S9_ASSERTION_NAMES = [
+    "recipe-executed-paused",
+    "gate-packetized",
+    "events-packetized",
+    "answer-approve-accepted",
+    "forward-approve",
+    "resume-launched",
+    "recipe-completes",
+    "dedupe-no-second-packet-or-resume",
+    "ledger-recipe-gates",
+]
+
 CNE = "could-not-evaluate"
 
 # CSI + OSC ANSI escape sequences (tmux pipe-pane logs carry terminal control codes).
@@ -469,6 +566,26 @@ SPECS = {
         bundle_rel="evals/pipelines/gate.dot",  # the pipeline, not a bundle
         answer_option="A",
         timeout_s=S7_TIMEOUT_S,
+    ),
+    8: ScenarioSpec(
+        number=8,
+        slug="s8-graduated-trust",
+        title="Scenario 8 — graduated trust auto-answer (step 6, real LLM)",
+        kind="decision",
+        prompt="",  # packets are seeded directly; see S8_SEED_PACKETS_SCRIPT
+        bundle_rel="bundles/triage.md",
+        answer_option="",  # P1 is auto-answered; `auto reject` uses the opposite option
+        timeout_s=S8_TIMEOUT_S,
+    ),
+    9: ScenarioSpec(
+        number=9,
+        slug="s9-recipe-gate-bridge",
+        title="Scenario 9 — recipe-gate bridge (step 6, deterministic recipe)",
+        kind="recipe-gate",
+        prompt="",  # no LLM: two bash echo steps with one approval gate
+        bundle_rel=S9_RECIPE_REL,  # the recipe, not a bundle
+        answer_option="approve",
+        timeout_s=S9_TIMEOUT_S,
     ),
 }
 
@@ -622,22 +739,22 @@ def cmd_ledger_cat(home: str) -> str:
 # -- scenario-5 command builders (cold triage) --------------------------------------
 
 
-def cmd_seed_rulebook(home: str) -> str:
-    """Write the seeded rulebook (template + seed rule) and echo it back for grading."""
+def cmd_seed_rulebook(home: str, content: str = S5_RULEBOOK_CONTENT) -> str:
+    """Write a seeded rulebook and echo it back for grading."""
     rulebook_path = f"{home}/rulebook.md"
     return (
         f"mkdir -p {shlex.quote(home)} && "
-        f"printf %s {shlex.quote(S5_RULEBOOK_CONTENT)} > {shlex.quote(rulebook_path)} && "
+        f"printf %s {shlex.quote(content)} > {shlex.quote(rulebook_path)} && "
         f"cat {shlex.quote(rulebook_path)}"
     )
 
 
-def cmd_seed_packets(cfg: Config, queue_dir: str) -> str:
-    """Seed P1/P2 via the ROOT queue lib (repo src on PYTHONPATH); prints both ids."""
+def cmd_seed_packets(cfg: Config, queue_dir: str, script: str = S5_SEED_PACKETS_SCRIPT) -> str:
+    """Seed packets via the ROOT queue lib (repo src on PYTHONPATH); prints the ids."""
     src = shlex.quote(f"{cfg.repo_dir}/src")
     return (
         f"{_env_prefix(queue_dir)} export PYTHONPATH={src}${{PYTHONPATH:+:$PYTHONPATH}}; "
-        f"mkdir -p {shlex.quote(queue_dir)} && python3 -c {shlex.quote(S5_SEED_PACKETS_SCRIPT)}"
+        f"mkdir -p {shlex.quote(queue_dir)} && python3 -c {shlex.quote(script)}"
     )
 
 
@@ -652,6 +769,41 @@ def cmd_triage_once(cfg: Config, queue_dir: str, home: str, bundle_uri: str, out
 
 def cmd_rulebook_apply(cfg: Config, queue_dir: str, home: str, proposal_id: str) -> str:
     return f"{_env_prefix(queue_dir, home)} {cfg.am_cli} rulebook apply {shlex.quote(proposal_id)}"
+
+
+# -- scenario-8 command builders (graduated trust) ------------------------------------
+
+
+def cmd_auto_reject(cfg: Config, queue_dir: str, home: str, packet_id: str, correct_option: str) -> str:
+    return (
+        f"{_env_prefix(queue_dir, home)} {cfg.am_cli} auto reject {shlex.quote(packet_id)} "
+        f"--correct-option {shlex.quote(correct_option)} --reason eval"
+    )
+
+
+# -- scenario-9 command builders (recipe-gate bridge) ---------------------------------
+
+
+def cmd_recipes_invoke(queue_dir: str, home: str, workdir: str, op_args: str, out_log: str) -> str:
+    """Run `amplifier tool invoke recipes <op_args> -o json` from the scenario workdir.
+
+    cwd matters: recipe sessions are project-scoped by working directory, and
+    RecipeGatePoller invokes from ITS cwd — execute, every poll, and resume
+    must all share this workdir. Output tee'd to an in-DTU log for artifacts.
+    """
+    return (
+        f"{_env_prefix(queue_dir, home)} mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} && "
+        f"amplifier tool invoke recipes {op_args} -o json 2>&1 | tee {shlex.quote(out_log)}; "
+        f"exit ${{PIPESTATUS[0]}}"
+    )
+
+
+def cmd_recipes_poll(cfg: Config, queue_dir: str, home: str, workdir: str, out_log: str) -> str:
+    """One recipe-gate poller pass (packetize new gates + forward answered ones)."""
+    return (
+        f"{_env_prefix(queue_dir, home)} mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} && "
+        f"{cfg.am_cli} recipes poll --once 2>&1 | tee {shlex.quote(out_log)}; exit ${{PIPESTATUS[0]}}"
+    )
 
 
 # -- scenario-6 command builders (judged finish lines) -------------------------------
@@ -758,7 +910,7 @@ class DtuExec:
         return ExecResult(rc=rc, stdout=stdout, stderr=stderr, command=cmd)
 
     def _log(self, label: str, result: ExecResult) -> None:
-        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = datetime.now(UTC).isoformat()
         entry = (
             f"[{stamp}] {label}\n"
             f"  $ {result.command}\n"
@@ -819,7 +971,7 @@ class Scenario:
 
     def snapshot(self, label: str, result: ExecResult) -> None:
         line = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "label": label,
             "rc": result.rc,
             "stdout": result.stdout,
@@ -1232,7 +1384,7 @@ def _collect_s4_artifacts(s: Scenario, home: str, notify_path: str, sup_log: str
             result = s.ex.run(cmd, label=f"artifact-{label}")
             if result.rc == 0:
                 (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
-        except Exception as e:  # artifact collection must never mask the verdict
+        except Exception as e:  # noqa: BLE001 — artifact collection must never mask the verdict
             print(f"    (artifact {label} not collected: {e})")
 
 
@@ -1563,7 +1715,7 @@ def _collect_s5_artifacts(s: Scenario, home: str) -> None:
             result = s.ex.run(cmd, label=f"artifact-{label}")
             if result.rc == 0:
                 (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
-        except Exception as e:  # artifact collection must never mask the verdict
+        except Exception as e:  # noqa: BLE001 — artifact collection must never mask the verdict
             print(f"    (artifact {label} not collected: {e})")
 
 
@@ -1835,7 +1987,7 @@ def _collect_s6_artifacts(s: Scenario, home: str, notify_path: str, sup_log: str
             result = s.ex.run(cmd, label=f"artifact-{label}")
             if result.rc == 0:
                 (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
-        except Exception as e:  # artifact collection must never mask the verdict
+        except Exception as e:  # noqa: BLE001 — artifact collection must never mask the verdict
             print(f"    (artifact {label} not collected: {e})")
 
 
@@ -2106,7 +2258,7 @@ def _collect_s7_artifacts(s: Scenario, home: str, dtu_sdir: str, workdir: str) -
             result = s.ex.run(cmd, label=f"artifact-{label}")
             if result.rc == 0:
                 (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
-        except Exception as e:  # artifact collection must never mask the verdict
+        except Exception as e:  # noqa: BLE001 — artifact collection must never mask the verdict
             print(f"    (artifact {label} not collected: {e})")
 
 
@@ -2282,6 +2434,451 @@ def run_scenario_7(cfg: Config) -> ScenarioResult:
             s.ex.run(cmd_kill_group(wu_pgid), label="cleanup-kill-workunit")
 
 
+# -- scenario 8: graduated trust auto-answer (step 6) ---------------------------------
+
+
+def run_scenario_8(cfg: Config) -> ScenarioResult:
+    spec = SPECS[8]
+    s = Scenario(cfg, spec)
+    started = time.monotonic()
+    home = f"{s.dtu_sdir}/home"
+    bundle_uri = f"file://{cfg.repo_dir}/{spec.bundle_rel}"
+    try:
+        # 1. Seed the PRE-PROMOTED rulebook.
+        seeded = s.ex.run(cmd_seed_rulebook(home, S8_RULEBOOK_CONTENT), label="seed-rulebook")
+        (s.out_dir / "rulebook-before.md").write_text(seeded.stdout, encoding="utf-8")
+        headings_ok = all(f"## {sec}" in seeded.stdout for sec in S5_RULEBOOK_SECTIONS)
+        if not s.check(
+            "rulebook-seeded-prepromoted",
+            seeded.rc == 0 and S8_PROMOTED_HEADING in seeded.stdout and S5_SEED_RULE in seeded.stdout and headings_ok,
+            f"rc={seeded.rc}, promoted heading={S8_PROMOTED_HEADING in seeded.stdout}, "
+            f"seed rule={S5_SEED_RULE in seeded.stdout}, all 5 headings={headings_ok}",
+        ):
+            _cne_rest(s, S8_ASSERTION_NAMES, "rulebook seeding failed")
+            return _finish(s, started)
+
+        # 2. Seed P1 (rule-covered) + P2 (control).
+        seeded_p = s.ex.run(cmd_seed_packets(cfg, s.queue_dir, S8_SEED_PACKETS_SCRIPT), label="seed-packets")
+        ids = [ln.strip() for ln in seeded_p.stdout.splitlines() if ln.strip().startswith("pkt-")]
+        if not s.check(
+            "packets-seeded",
+            seeded_p.rc == 0 and len(ids) == 2 and ids[0] != ids[1],
+            f"rc={seeded_p.rc}, ids={ids}, stderr={seeded_p.stderr.strip()[:200]!r}",
+        ):
+            _cne_rest(s, S8_ASSERTION_NAMES, "packet seeding failed")
+            return _finish(s, started)
+        p1, p2 = ids
+        s.snapshot("post-seed", s.ex.run(cmd_queue_list(cfg, s.queue_dir), label="queue-list-post-seed"))
+
+        # 3. One real-LLM triage pass over both packets.
+        pass1 = _s5_triage_pass(s, cfg, home, bundle_uri, 1)
+        s.check("triage-pass-ok", pass1.rc == 0, f"rc={pass1.rc}, stdout tail: {pass1.stdout.strip()[-300:]!r}")
+
+        # 4. P1 auto-answered (all conservative bounds cleared).
+        p1_answered = _read_packet_file(s, f"{s.queue_dir}/answered/{p1}.json", "p1-answered-read")
+        actual_answer: str | None = None
+        if p1_answered is None:
+            # Honest bound note: high-confidence is required — capture the verdict.
+            p1_pending = _read_packet_file(s, f"{s.queue_dir}/pending/{p1}.json", "p1-pending-read")
+            if p1_pending is not None:
+                (s.out_dir / "p1-pending.json").write_text(json.dumps(p1_pending, indent=2), encoding="utf-8")
+                triage = p1_pending.get("triage") or {}
+                rec = p1_pending.get("recommendation") or {}
+                s.check(
+                    "p1-auto-answered",
+                    False,
+                    f"P1 NOT auto-answered — still pending with triage={{handled_by: {triage.get('handled_by')!r}, "
+                    f"why: {str(triage.get('why', ''))[:120]!r}, rule_refs: {triage.get('rule_refs')!r}}}, "
+                    f"recommendation={{option: {rec.get('option')!r}, confidence: {rec.get('confidence')!r}}}. "
+                    f"Auto-answer requires confidence==high + rule_refs resolving to phase-2 sections; if the "
+                    f"model returned lower confidence, the bound legitimately blocked it — tune the scenario, "
+                    f"not the code.",
+                )
+            else:
+                locate = s.ex.run(cmd_queue_show(cfg, s.queue_dir, p1), label="p1-locate")
+                s.check(
+                    "p1-auto-answered",
+                    False,
+                    f"P1 in neither answered/ nor pending/ — queue show says: {locate.stdout.strip()[:300]!r}",
+                )
+        else:
+            (s.out_dir / "p1-answered.json").write_text(json.dumps(p1_answered, indent=2), encoding="utf-8")
+            resolution = p1_answered.get("resolution") or {}
+            actual_answer = resolution.get("answer")
+            pending_gone = s.ex.run(cmd_file_absent(f"{s.queue_dir}/pending/{p1}.json"), label="p1-pending-absent")
+            s.check(
+                "p1-auto-answered",
+                resolution.get("answered_by") == "manager-auto"
+                and actual_answer == S8_RULE_IMPLIED_OPTION
+                and pending_gone.stdout.strip() == "absent",
+                f"answered_by={resolution.get('answered_by')!r}, answer={actual_answer!r} "
+                f"(rule-implied: {S8_RULE_IMPLIED_OPTION!r}), pending entry: {pending_gone.stdout.strip()}",
+            )
+
+        # 5. Auto review record (unreviewed) in queue/auto/.
+        record = _read_packet_file(s, f"{s.queue_dir}/auto/{p1}.json", "p1-auto-record-read")
+        if record is None:
+            s.cne("p1-auto-record", f"auto/{p1}.json missing or unparseable")
+        else:
+            (s.out_dir / "p1-auto-record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+            s.check(
+                "p1-auto-record",
+                record.get("reviewed") is False
+                and "Auto-answer rules" in (record.get("sections") or [])
+                and record.get("answer") == (actual_answer or S8_RULE_IMPLIED_OPTION),
+                f"reviewed={record.get('reviewed')}, sections={record.get('sections')}, "
+                f"answer={record.get('answer')!r}",
+            )
+
+        # 6. Events + ledger.
+        events, malformed = _fetch_events(s, home)
+        auto_events = [e for e in _events_named(events, "triage:auto_answered") if e.get("packet_id") == p1]
+        ledger_records, _ = _parse_jsonl(s.ex.run(cmd_ledger_cat(home), label="ledger-fetch-1").stdout)
+        ledger_auto = [r for r in ledger_records if r.get("kind") == "triage_auto_answered"]
+        s.check(
+            "events-ledger-auto",
+            len(auto_events) == 1 and len(ledger_auto) >= 1,
+            f"triage:auto_answered(P1)={len(auto_events)}, ledger triage_auto_answered={len(ledger_auto)} "
+            f"(malformed lines: {malformed})",
+        )
+
+        # 7. P2 stays Phase-1 recommend-only (the bounds hold in the control direction).
+        p2_pending = _read_packet_file(s, f"{s.queue_dir}/pending/{p2}.json", "p2-pending-read")
+        if p2_pending is None:
+            locate = s.ex.run(cmd_queue_show(cfg, s.queue_dir, p2), label="p2-locate")
+            s.check(
+                "p2-not-auto-answered",
+                False,
+                f"P2 not in pending/ — queue show says: {locate.stdout.strip()[:300]!r} "
+                "(auto-answered or bounced: either is a bounds failure for the control packet)",
+            )
+        else:
+            (s.out_dir / "p2-pending.json").write_text(json.dumps(p2_pending, indent=2), encoding="utf-8")
+            p2_triage = p2_pending.get("triage") or {}
+            s.check(
+                "p2-not-auto-answered",
+                p2_triage.get("handled_by") == "manager-recommend",
+                f"triage={{handled_by: {p2_triage.get('handled_by')!r}, why: {str(p2_triage.get('why', ''))[:120]!r}}}",
+            )
+
+        # 8. auto reject with the OTHER option — requires an auto-answer to review.
+        if actual_answer is None or record is None:
+            _cne_rest(s, S8_ASSERTION_NAMES, "no auto-answer to review (see p1-auto-answered)")
+            return _finish(s, started)
+        opposite = "A" if actual_answer == "B" else "B"
+        reject = s.ex.run(cmd_auto_reject(cfg, s.queue_dir, home, p1, opposite), label="auto-reject")
+        s.check(
+            "auto-reject-accepted",
+            reject.rc == 0,
+            f"auto answer {actual_answer!r} -> correction {opposite!r} (rc={reject.rc}, "
+            f"stderr={reject.stderr.strip()[:150]!r})",
+        )
+
+        # 9. Record reviewed with the correction.
+        reviewed = _read_packet_file(s, f"{s.queue_dir}/auto/{p1}.json", "p1-auto-record-reviewed-read")
+        if reviewed is None:
+            s.cne("auto-record-reviewed", f"auto/{p1}.json missing after review")
+        else:
+            review = reviewed.get("review") or {}
+            s.check(
+                "auto-record-reviewed",
+                reviewed.get("reviewed") is True
+                and review.get("action") == "rejected"
+                and review.get("correct_option") == opposite,
+                f"reviewed={reviewed.get('reviewed')}, review={review}",
+            )
+
+        # 10. Section demoted, visibly, in the heading annotation.
+        rulebook_after = s.ex.run(cmd_cat(f"{home}/rulebook.md"), label="rulebook-after-read")
+        s.check(
+            "section-demoted",
+            S8_DEMOTED_HEADING in rulebook_after.stdout,
+            f"{S8_DEMOTED_HEADING!r} present={S8_DEMOTED_HEADING in rulebook_after.stdout}",
+        )
+
+        # 11. trust:demoted event.
+        events_after, _ = _fetch_events(s, home)
+        demoted = [e for e in _events_named(events_after, "trust:demoted") if e.get("packet_id") == p1]
+        s.check(
+            "event-trust-demoted",
+            len(demoted) == 1
+            and demoted[0].get("section") == "Auto-answer rules"
+            and demoted[0].get("from_phase") == 2,
+            f"trust:demoted count={len(demoted)}, "
+            f"details={[{k: e.get(k) for k in ('section', 'from_phase', 'phase', 'streak')} for e in demoted]}",
+        )
+        return _finish(s, started)
+    finally:
+        _collect_s5_artifacts(s, home)
+
+
+# -- scenario 9: recipe-gate bridge (step 6) -------------------------------------------
+
+
+def _parse_tool_invoke(stdout: str) -> dict[str, Any] | None:
+    """Parse `amplifier tool invoke ... -o json` output into the tool's result dict.
+
+    Mirrors recipe_gates.parse_invoke_output, hardened for noise lines that may
+    themselves contain braces: candidate parse positions are lines starting
+    with '{', tried LAST first (the envelope is printed last). The envelope's
+    'result' field is the string repr of a Python dict (observed shape).
+    """
+    import ast
+
+    lines = stdout.splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("{")]
+    for i in reversed(starts):
+        try:
+            envelope = json.loads("\n".join(lines[i:]))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(envelope, dict) or envelope.get("status") != "success":
+            continue
+        result = envelope.get("result")
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                parsed = ast.literal_eval(result)
+            except (ValueError, SyntaxError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _s9_exec(s: Scenario, cmd: str, label: str, artifact: str) -> ExecResult:
+    result = s.ex.run(cmd, label=label, timeout=min(S9_INVOKE_TIMEOUT_S, max(30.0, s.remaining())))
+    (s.out_dir / artifact).write_text(result.stdout + result.stderr, encoding="utf-8")
+    return result
+
+
+def _collect_s9_artifacts(s: Scenario, home: str) -> None:
+    resume_logs_cmd = (
+        f"for f in {shlex.quote(home + '/recipe-gates')}/*.resume.log; do "
+        f'echo "=== $f ==="; cat "$f"; echo; done 2>/dev/null || true'
+    )
+    artifacts = [
+        ("events", cmd_cat(f"{home}/events.jsonl"), "events.jsonl"),
+        ("ledger", cmd_ledger_cat(home), "ledger.jsonl"),
+        ("gates-state", cmd_cat(f"{home}/recipe-gates.json"), "recipe-gates.json"),
+        ("resume-logs", resume_logs_cmd, "resume.log"),
+    ]
+    for label, cmd, filename in artifacts:
+        try:
+            result = s.ex.run(cmd, label=f"artifact-{label}")
+            if result.rc == 0:
+                (s.out_dir / filename).write_text(result.stdout, encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — artifact collection must never mask the verdict
+            print(f"    (artifact {label} not collected: {e})")
+
+
+def run_scenario_9(cfg: Config) -> ScenarioResult:
+    spec = SPECS[9]
+    s = Scenario(cfg, spec)
+    started = time.monotonic()
+    home = f"{s.dtu_sdir}/home"
+    workdir = f"{s.dtu_sdir}/work"
+    recipe_path = f"{cfg.repo_dir}/{spec.bundle_rel}"
+    try:
+        # 1. Execute the staged recipe (synchronous; returns paused_for_approval).
+        execute = _s9_exec(
+            s,
+            cmd_recipes_invoke(
+                s.queue_dir,
+                home,
+                workdir,
+                f"operation=execute recipe_path={shlex.quote(recipe_path)}",
+                f"{s.dtu_sdir}/execute.out",
+            ),
+            "recipes-execute",
+            "execute.out",
+        )
+        result = _parse_tool_invoke(execute.stdout) if execute.rc == 0 else None
+        session_id = str(result.get("session_id", "")) if result else ""
+        if result is None or result.get("status") != "paused_for_approval" or not session_id:
+            if any(m in execute.stdout + execute.stderr for m in S9_TOOL_MISSING_MARKERS):
+                s.cne(
+                    "recipe-executed-paused",
+                    f"the recipes tool is NOT available in this DTU's default bundle — honest env failure "
+                    f"(rc={execute.rc}). Captured output tail: {(execute.stdout + execute.stderr)[-400:]!r}",
+                )
+            else:
+                s.check(
+                    "recipe-executed-paused",
+                    False,
+                    f"rc={execute.rc}, parsed={result!r} (expected status=paused_for_approval with a session_id); "
+                    f"output tail: {execute.stdout.strip()[-300:]!r}",
+                )
+            _cne_rest(s, S9_ASSERTION_NAMES, "recipe never reached the approval gate")
+            return _finish(s, started)
+        s.check("recipe-executed-paused", True, f"status=paused_for_approval, session_id={session_id}")
+
+        # 2. Poll #1: packetize the gate.
+        _s9_exec(
+            s, cmd_recipes_poll(cfg, s.queue_dir, home, workdir, f"{s.dtu_sdir}/poll-1.out"), "poll-1", "poll-1.out"
+        )
+        listing = s.ex.run(cmd_queue_list(cfg, s.queue_dir), label="queue-list-post-poll1")
+        s.snapshot("post-poll1", listing)
+        gate_packets: list[dict[str, Any]] = []
+        if listing.rc == 0:
+            try:
+                gate_packets = [
+                    p
+                    for p in json.loads(listing.stdout)
+                    if isinstance(p, dict) and (p.get("source") or {}).get("kind") == spec.kind
+                ]
+            except json.JSONDecodeError:
+                gate_packets = []
+        if len(gate_packets) != 1:
+            s.check(
+                "gate-packetized", False, f"expected exactly 1 pending kind={spec.kind} packet, got {len(gate_packets)}"
+            )
+            _cne_rest(s, S9_ASSERTION_NAMES, "gate never packetized")
+            return _finish(s, started)
+        packet = gate_packets[0]
+        packet_id = str(packet.get("id", ""))
+        (s.out_dir / "packet-pending.json").write_text(json.dumps(packet, indent=2), encoding="utf-8")
+        option_ids = [o.get("id") for o in packet.get("options", []) if isinstance(o, dict)]
+        s.check(
+            "gate-packetized",
+            option_ids == ["approve", "deny"]
+            and (packet.get("source") or {}).get("work_unit") == session_id
+            and f"stage: {S9_STAGE_NAME}" in str(packet.get("context", "")),
+            f"packet {packet_id}: options={option_ids}, work_unit={(packet.get('source') or {}).get('work_unit')!r}, "
+            f"context={str(packet.get('context', ''))[:100]!r}",
+        )
+
+        # 3. recipe_gates:packetized event.
+        events, _ = _fetch_events(s, home)
+        packetized = [e for e in _events_named(events, "recipe_gates:packetized") if e.get("packet_id") == packet_id]
+        s.check(
+            "events-packetized",
+            len(packetized) == 1
+            and packetized[0].get("session_id") == session_id
+            and packetized[0].get("stage_name") == S9_STAGE_NAME,
+            f"count={len(packetized)}, details={packetized}",
+        )
+
+        # 4. Answer approve.
+        answer = s.answer(packet_id, spec.answer_option)
+        s.check("answer-approve-accepted", answer.rc == 0, f"rc={answer.rc} stderr={answer.stderr.strip()[:150]!r}")
+
+        # 5. Poll #2: forward the approve to the recipes tool (+ auto-resume launch).
+        poll2 = _s9_exec(
+            s, cmd_recipes_poll(cfg, s.queue_dir, home, workdir, f"{s.dtu_sdir}/poll-2.out"), "poll-2", "poll-2.out"
+        )
+        events2, _ = _fetch_events(s, home)
+        resolved = [e for e in _events_named(events2, "recipe_gates:resolved") if e.get("packet_id") == packet_id]
+        s.check(
+            "forward-approve",
+            poll2.rc == 0 and len(resolved) == 1 and resolved[0].get("answer") == "approve",
+            f"poll2 rc={poll2.rc}, recipe_gates:resolved count={len(resolved)}, "
+            f"details={[{k: e.get(k) for k in ('answer', 'session_id', 'stage_name')} for e in resolved]}",
+        )
+
+        # 6. Auto-resume launched by the poller (step-6 decision: _launch_resume —
+        #    detached background subprocess; event + ledger + log are its only surfaces).
+        resume_log_path = f"{home}/recipe-gates/{session_id}.resume.log"
+        launched = [
+            e for e in _events_named(events2, "recipe_gates:resume_launched") if e.get("session_id") == session_id
+        ]
+        ledger_records6, _ = _parse_jsonl(s.ex.run(cmd_ledger_cat(home), label="ledger-fetch-resume").stdout)
+        ledger_launched = [r for r in ledger_records6 if r.get("kind") == "recipe_gate_resume_launched"]
+        log_exists = s.ex.run(cmd_file_exists(resume_log_path), label="resume-log-exists")
+        s.check(
+            "resume-launched",
+            len(launched) == 1 and len(ledger_launched) == 1 and log_exists.stdout.strip() == "yes",
+            f"recipe_gates:resume_launched events={len(launched)}, "
+            f"ledger recipe_gate_resume_launched={len(ledger_launched)}, "
+            f"resume log exists: {log_exists.stdout.strip()} ({resume_log_path})",
+        )
+
+        # 7. Recipe completes — poll operation=list until the after-gate step shows
+        #    in completed_steps (verified surface: list has NO status field; for this
+        #    recipe, completion == "step-two" in completed_steps).
+        def poll_completed() -> list[str] | None:
+            listing = s.ex.run(
+                cmd_recipes_invoke(s.queue_dir, home, workdir, "operation=list", f"{s.dtu_sdir}/list-final.out"),
+                label="recipes-list-poll",
+                timeout=min(S9_INVOKE_TIMEOUT_S, max(30.0, s.remaining())),
+            )
+            if listing.rc != 0:
+                return None
+            payload = _parse_tool_invoke(listing.stdout)
+            if not payload:
+                return None
+            for sess in payload.get("sessions") or []:
+                if isinstance(sess, dict) and sess.get("session_id") == session_id:
+                    steps = [str(x) for x in (sess.get("completed_steps") or [])]
+                    (s.out_dir / "list-final.out").write_text(listing.stdout, encoding="utf-8")
+                    return steps if S9_FINAL_STEP in steps else None
+            return None
+
+        completed_steps = _poll(s, S9_COMPLETE_WAIT_S, poll_completed)
+        resume_log = s.ex.run(cmd_cat(resume_log_path), label="resume-log-fetch")
+        if resume_log.rc == 0:
+            (s.out_dir / "resume.log").write_text(resume_log.stdout, encoding="utf-8")
+        if completed_steps is None:
+            s.check(
+                "recipe-completes",
+                False,
+                f"session {session_id} never showed {S9_FINAL_STEP!r} in completed_steps within "
+                f"{S9_COMPLETE_WAIT_S:.0f}s; resume log tail: {resume_log.stdout.strip()[-400:]!r}",
+            )
+        else:
+            s.check(
+                "recipe-completes",
+                True,
+                f"completed_steps={completed_steps}; resume log tail: {resume_log.stdout.strip()[-200:]!r}",
+            )
+
+        # 8. Poll #3: dedupe — no re-packetize AND no second resume launch
+        #    (resume_launched_at idempotency: event count stays exactly 1).
+        _s9_exec(
+            s, cmd_recipes_poll(cfg, s.queue_dir, home, workdir, f"{s.dtu_sdir}/poll-3.out"), "poll-3", "poll-3.out"
+        )
+        listing3 = s.ex.run(cmd_queue_list(cfg, s.queue_dir), label="queue-list-post-poll3")
+        s.snapshot("post-poll3", listing3)
+        remaining_gates = 0
+        if listing3.rc == 0:
+            try:
+                remaining_gates = sum(
+                    1
+                    for p in json.loads(listing3.stdout)
+                    if isinstance(p, dict) and (p.get("source") or {}).get("kind") == spec.kind
+                )
+            except json.JSONDecodeError:
+                remaining_gates = -1
+        events3, _ = _fetch_events(s, home)
+        launched_after = [
+            e for e in _events_named(events3, "recipe_gates:resume_launched") if e.get("session_id") == session_id
+        ]
+        s.check(
+            "dedupe-no-second-packet-or-resume",
+            remaining_gates == 0 and len(launched_after) == 1,
+            f"pending kind={spec.kind} packets after poll #3: {remaining_gates}; "
+            f"recipe_gates:resume_launched count: {len(launched_after)} "
+            f"(must stay 1 — resume_launched_at idempotency)",
+        )
+
+        # 9. Ledger.
+        ledger_records, bad = _parse_jsonl(s.ex.run(cmd_ledger_cat(home), label="ledger-fetch").stdout)
+        kinds: dict[str, int] = {}
+        for r in ledger_records:
+            kind = str(r.get("kind"))
+            kinds[kind] = kinds.get(kind, 0) + 1
+        s.check(
+            "ledger-recipe-gates",
+            kinds.get("recipe_gate_packetized", 0) == 1
+            and kinds.get("recipe_gate_resolved", 0) == 1
+            and kinds.get("recipe_gate_resume_launched", 0) == 1,
+            f"kinds={kinds}, malformed={bad}",
+        )
+        return _finish(s, started)
+    finally:
+        _collect_s9_artifacts(s, home)
+
+
 def _grade_decision_schema(show: ExecResult) -> tuple[bool, str]:
     if show.rc != 0:
         return False, f"queue show rc={show.rc} stderr={show.stderr.strip()!r}"
@@ -2314,6 +2911,8 @@ RUNNERS = {
     5: run_scenario_5,
     6: run_scenario_6,
     7: run_scenario_7,
+    8: run_scenario_8,
+    9: run_scenario_9,
 }
 
 
@@ -2332,8 +2931,10 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     sup_pgid_file = f"{dtu_sdir}/supervisor.pgid"
     steps.append(
         (
-            "start supervisor in background (own process group; stdout+stderr APPEND to supervisor.log; "
-            "the setsid'd session writes its REAL pgid to supervisor.pgid — `$!` is only the wrapping subshell)",
+            (
+                "start supervisor in background (own process group; stdout+stderr APPEND to supervisor.log; "
+                "the setsid'd session writes its REAL pgid to supervisor.pgid — `$!` is only the wrapping subshell)"
+            ),
             cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log, sup_pgid_file),
         )
     )
@@ -2357,14 +2958,18 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
             cmd_cat(f"{home}/events.jsonl"),
         ),
         (
-            f"poll notify sink (<= {S4_NOTIFY_WAIT_S:.0f}s): every created packet id covered by well-formed "
-            "batch records (soft detail: ONE batch covering both)",
+            (
+                f"poll notify sink (<= {S4_NOTIFY_WAIT_S:.0f}s): every created packet id covered by well-formed "
+                "batch records (soft detail: ONE batch covering both)"
+            ),
             cmd_cat(notify_path),
         ),
         ("SIGKILL the supervisor process group mid-run (pgid from supervisor.pgid)", cmd_kill_group(sup_pid)),
         (
-            "VERIFY the supervisor is dead (a surviving one would run concurrently with the restart "
-            "and duplicate events — hard FAIL)",
+            (
+                "VERIFY the supervisor is dead (a surviving one would run concurrently with the restart "
+                "and duplicate events — hard FAIL)"
+            ),
             cmd_worker_alive(sup_pid),
         ),
         (
@@ -2417,13 +3022,17 @@ def _plan_scenario_5(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
             cmd_seed_packets(cfg, queue_dir),
         ),
         (
-            f"pass 1: real-LLM cold triage on both packets (synchronous; per-session --timeout {S5_SESSION_TIMEOUT_S:g}s; "
-            f"exec budget {S5_TRIAGE_EXEC_TIMEOUT_S:.0f}s)",
+            (
+                f"pass 1: real-LLM cold triage on both packets (synchronous; per-session --timeout {S5_SESSION_TIMEOUT_S:g}s; "
+                f"exec budget {S5_TRIAGE_EXEC_TIMEOUT_S:.0f}s)"
+            ),
             cmd_triage_once(cfg, queue_dir, home, bundle_uri, f"{dtu_sdir}/triage-pass-1.out"),
         ),
         (
-            "grade P1: still pending, triage.handled_by=manager-recommend, why non-empty, rule_refs list, "
-            "recommendation.option in {A,B}",
+            (
+                "grade P1: still pending, triage.handled_by=manager-recommend, why non-empty, rule_refs list, "
+                "recommendation.option in {A,B}"
+            ),
             cmd_cat(f"{queue_dir}/pending/{p1}.json"),
         ),
         (
@@ -2441,8 +3050,10 @@ def _plan_scenario_5(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
             cmd_triage_once(cfg, queue_dir, home, bundle_uri, f"{dtu_sdir}/triage-pass-2.out"),
         ),
         (
-            "grade proposals: exactly ONE record for P1 — proposal {sentence, section in the 5} OR explicit "
-            "none {reason}; branch recorded",
+            (
+                "grade proposals: exactly ONE record for P1 — proposal {sentence, section in the 5} OR explicit "
+                "none {reason}; branch recorded"
+            ),
             cmd_cat(f"{home}/rulebook-proposals.jsonl"),
         ),
         (
@@ -2494,8 +3105,10 @@ def _plan_scenario_6(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
         ),
         ("read the supervisor's real pgid (poll until non-empty)", cmd_read_pgid(sup_pgid_file)),
         (
-            "dispatch G: writes artifact WITH marker into its worker dir, exits 0; grep-judge on RELATIVE "
-            "artifact.txt (judge-cwd contract)",
+            (
+                "dispatch G: writes artifact WITH marker into its worker dir, exits 0; grep-judge on RELATIVE "
+                "artifact.txt (judge-cwd contract)"
+            ),
             cmd_dispatch_fake(
                 cfg,
                 queue_dir,
@@ -2523,8 +3136,10 @@ def _plan_scenario_6(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
             cmd_dispatch_fake(cfg, queue_dir, home, "u", "finish-line u worker (fake)", "echo unjudged", None),
         ),
         (
-            f"poll every {POLL_INTERVAL_S:.0f}s (<= {S6_FINISH_WAIT_S:.0f}s) until 3 worker:finished events; then grade "
-            "loop:closed(am-g, judge_output) / loop:failed(am-b, reason) / judged fields / no loop:* for am-u",
+            (
+                f"poll every {POLL_INTERVAL_S:.0f}s (<= {S6_FINISH_WAIT_S:.0f}s) until 3 worker:finished events; then grade "
+                "loop:closed(am-g, judge_output) / loop:failed(am-b, reason) / judged fields / no loop:* for am-u"
+            ),
             cmd_cat(f"{home}/events.jsonl"),
         ),
         ("grade judge.log for am-g exists non-empty", cmd_cat(f"{home}/workers/am-g/judge.log")),
@@ -2554,20 +3169,26 @@ def _plan_scenario_7(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     pkt, wu_pgid = "<PACKET_ID>", "<WU_PGID>"
     return [
         (
-            "launch workunit in background (own process group; cwd = workdir so tool nodes write relative "
-            "A.txt/R.txt there; stdout+stderr -> wu.log; exit -> wu.exit; pgid -> wu.pgid)",
+            (
+                "launch workunit in background (own process group; cwd = workdir so tool nodes write relative "
+                "A.txt/R.txt there; stdout+stderr -> wu.log; exit -> wu.exit; pgid -> wu.pgid)"
+            ),
             cmd_workunit_launch(cfg, queue_dir, home, dtu_sdir, workdir, pipeline, S7_NAME),
         ),
         ("read the workunit's real pgid (poll until non-empty)", cmd_read_pgid(f"{dtu_sdir}/wu.pgid")),
         (
-            f"poll every {POLL_INTERVAL_S:.0f}s (<= {S7_GATE_WAIT_S:.0f}s) for a kind=attractor-gate packet, "
-            "checking wu.exit each iteration (early death + missing-[attractor]-extra marker in wu.log => "
-            "assertion 1 could-not-evaluate with the error text captured — honest env failure)",
+            (
+                f"poll every {POLL_INTERVAL_S:.0f}s (<= {S7_GATE_WAIT_S:.0f}s) for a kind=attractor-gate packet, "
+                "checking wu.exit each iteration (early death + missing-[attractor]-extra marker in wu.log => "
+                "assertion 1 could-not-evaluate with the error text captured — honest env failure)"
+            ),
             cmd_queue_list(cfg, queue_dir),
         ),
         (
-            f"grade packet shape: question == {S7_QUESTION!r}, option ids exactly [A, R] with labels containing "
-            f"Approve/Reject, source.work_unit == {S7_NAME!r}, 'stage: gate' in context",
+            (
+                f"grade packet shape: question == {S7_QUESTION!r}, option ids exactly [A, R] with labels containing "
+                f"Approve/Reject, source.work_unit == {S7_NAME!r}, 'stage: gate' in context"
+            ),
             cmd_queue_show(cfg, queue_dir, pkt),
         ),
         (
@@ -2590,6 +3211,124 @@ def _plan_scenario_7(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
     ]
 
 
+def _plan_scenario_8(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[str, str]]:
+    home = f"{dtu_sdir}/home"
+    bundle_uri = f"file://{cfg.repo_dir}/{SPECS[8].bundle_rel}"
+    p1 = "<P1_PACKET_ID>"
+    return [
+        (
+            f"seed rulebook with '## Auto-answer rules' PRE-PROMOTED ({S8_PROMOTED_HEADING!r}) + the seed rule",
+            cmd_seed_rulebook(home, S8_RULEBOOK_CONTENT),
+        ),
+        (
+            "seed P1 (rule-covered rollout decision) + P2 (control: decidable but NOT rule-covered); prints both ids",
+            cmd_seed_packets(cfg, queue_dir, S8_SEED_PACKETS_SCRIPT),
+        ),
+        (
+            "one real-LLM triage pass over both packets",
+            cmd_triage_once(cfg, queue_dir, home, bundle_uri, f"{dtu_sdir}/triage-pass-1.out"),
+        ),
+        (
+            (
+                "grade P1 AUTO-ANSWERED: answered/<P1>.json with resolution.answered_by=manager-auto, "
+                f"answer == rule-implied {S8_RULE_IMPLIED_OPTION!r} (honest bound: confidence must be high — "
+                "a medium verdict blocks auto-answer and is graded FAIL with the verdict captured)"
+            ),
+            cmd_cat(f"{queue_dir}/answered/{p1}.json"),
+        ),
+        (
+            "grade auto review record: queue/auto/<P1>.json {reviewed: false, sections includes Auto-answer rules}",
+            cmd_cat(f"{queue_dir}/auto/{p1}.json"),
+        ),
+        ("grade events: 1 triage:auto_answered(P1); ledger: triage_auto_answered", cmd_cat(f"{home}/events.jsonl")),
+        (
+            "grade P2 NOT auto-answered: still pending with triage.handled_by=manager-recommend",
+            cmd_cat(f"{queue_dir}/pending/<P2_PACKET_ID>.json"),
+        ),
+        (
+            "auto reject P1 with the OTHER option (opposite of the actual auto answer)",
+            cmd_auto_reject(cfg, queue_dir, home, p1, "<OPPOSITE_OPTION>"),
+        ),
+        (
+            "grade record reviewed: {reviewed: true, review.action: rejected, correct_option recorded}",
+            cmd_cat(f"{queue_dir}/auto/{p1}.json"),
+        ),
+        (
+            f"grade demotion: rulebook.md contains {S8_DEMOTED_HEADING!r}",
+            cmd_cat(f"{home}/rulebook.md"),
+        ),
+        (
+            "grade events: exactly 1 trust:demoted (section Auto-answer rules, from_phase 2)",
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+    ]
+
+
+def _plan_scenario_9(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[str, str]]:
+    home = f"{dtu_sdir}/home"
+    workdir = f"{dtu_sdir}/work"
+    recipe_path = f"{cfg.repo_dir}/{SPECS[9].bundle_rel}"
+    pkt, sid = "<PACKET_ID>", "<SESSION_ID>"
+    return [
+        (
+            (
+                "execute the staged recipe (SYNCHRONOUS — returns status=paused_for_approval + session_id; "
+                "recipes tool unavailable => assertion 1 could-not-evaluate with output captured). "
+                "cwd = workdir: recipe sessions are project-scoped by working directory"
+            ),
+            cmd_recipes_invoke(
+                queue_dir,
+                home,
+                workdir,
+                f"operation=execute recipe_path={shlex.quote(recipe_path)}",
+                f"{dtu_sdir}/execute.out",
+            ),
+        ),
+        (
+            "poll #1 (packetize): the pending gate becomes ONE kind=recipe-gate packet",
+            cmd_recipes_poll(cfg, queue_dir, home, workdir, f"{dtu_sdir}/poll-1.out"),
+        ),
+        (
+            (
+                "grade the packet: options exactly [approve, deny], source.work_unit == session_id, "
+                f"'stage: {S9_STAGE_NAME}' in context; + recipe_gates:packetized event"
+            ),
+            cmd_queue_list(cfg, queue_dir),
+        ),
+        ("answer approve via the CLI", cmd_answer(cfg, queue_dir, pkt, "approve", "eval")),
+        (
+            (
+                "poll #2 (forward + AUTO-RESUME): operation=approve is forwarded with the rationale as message "
+                "(recipe_gates:resolved), then the poller launches operation=resume as a DETACHED background "
+                "subprocess (recipe_gates:resume_launched + ledger + resume log; idempotent via resume_launched_at)"
+            ),
+            cmd_recipes_poll(cfg, queue_dir, home, workdir, f"{dtu_sdir}/poll-2.out"),
+        ),
+        (
+            "grade resume-launched: 1 recipe_gates:resume_launched event + ledger entry + resume log file exists",
+            cmd_file_exists(f"{home}/recipe-gates/{sid}.resume.log"),
+        ),
+        (
+            (
+                f"poll operation=list (<= {S9_COMPLETE_WAIT_S:.0f}s) until the session's completed_steps includes "
+                f"{S9_FINAL_STEP!r} (verified surface: list has NO status field); capture the resume log tail"
+            ),
+            cmd_recipes_invoke(queue_dir, home, workdir, "operation=list", f"{dtu_sdir}/list-final.out"),
+        ),
+        (
+            (
+                "poll #3 (dedupe): no second recipe-gate packet AND recipe_gates:resume_launched count stays "
+                "exactly 1 (resume_launched_at idempotency)"
+            ),
+            cmd_recipes_poll(cfg, queue_dir, home, workdir, f"{dtu_sdir}/poll-3.out"),
+        ),
+        (
+            "grade ledger: recipe_gate_packetized x1 + recipe_gate_resolved x1 + recipe_gate_resume_launched x1",
+            cmd_ledger_cat(home),
+        ),
+    ]
+
+
 def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
     dtu_sdir = f"{cfg.work_dir}/{cfg.run_id}/{spec.slug}"
     queue_dir = f"{dtu_sdir}/queue"
@@ -2603,10 +3342,16 @@ def plan_scenario(cfg: Config, spec: ScenarioSpec) -> list[tuple[str, str]]:
         return _plan_scenario_6(cfg, dtu_sdir, queue_dir)
     if spec.number == 7:
         return _plan_scenario_7(cfg, dtu_sdir, queue_dir)
+    if spec.number == 8:
+        return _plan_scenario_8(cfg, dtu_sdir, queue_dir)
+    if spec.number == 9:
+        return _plan_scenario_9(cfg, dtu_sdir, queue_dir)
     steps: list[tuple[str, str]] = [
         (
-            "launch worker in background (own process group; stdout+stderr -> worker.log; "
-            "exit code -> worker.exit; prints PID)",
+            (
+                "launch worker in background (own process group; stdout+stderr -> worker.log; "
+                "exit code -> worker.exit; prints PID)"
+            ),
             cmd_launch_worker(cfg, queue_dir, dtu_sdir, bundle, spec.prompt),
         ),
         (
@@ -2681,7 +3426,7 @@ def write_results(cfg: Config, results: list[ScenarioResult]) -> None:
         "# attention-manager eval results",
         "",
         f"- run id: `{cfg.run_id}`",
-        f"- generated: {datetime.now(timezone.utc).isoformat()}",
+        f"- generated: {datetime.now(UTC).isoformat()}",
         "",
         "| scenario | verdict | assertions | duration |",
         "|---|---|---|---|",
@@ -2716,7 +3461,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--scenario",
         action="append",
-        choices=["1", "2", "3", "4", "5", "6", "7"],
+        choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
         help="run only this scenario (repeatable)",
     )
     parser.add_argument("--dry-run", action="store_true", help="print planned command sequences; no DTU required")
@@ -2733,8 +3478,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    scenario_numbers = sorted({int(n) for n in (args.scenario or ["1", "2", "3", "4", "5", "6", "7"])})
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    scenario_numbers = sorted({int(n) for n in (args.scenario or [str(n) for n in RUNNERS])})
+    run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_ROOT) / run_id
     cfg = Config(
         dtu_exec=args.dtu_exec,

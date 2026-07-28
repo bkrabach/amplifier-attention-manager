@@ -38,8 +38,7 @@ from typing import Any
 
 from .packet import utc_now_iso
 from .queue import ENV_QUEUE_DIR
-from .state import ENV_HOME
-from .state import SESSION_PREFIX
+from .state import ENV_HOME, SESSION_PREFIX
 
 EXIT_SENTINEL_TEMPLATE = "__AM_WORKER_EXIT:{code}__"
 EXIT_SENTINEL_RE = re.compile(r"__AM_WORKER_EXIT:(\d+)__")

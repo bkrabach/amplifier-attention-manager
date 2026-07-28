@@ -20,12 +20,10 @@ import uuid
 from pathlib import Path
 
 import pytest
+
 from attention_manager import judge as judge_mod
-from attention_manager.cli import format_ledger_summary
-from attention_manager.cli import main
-from attention_manager.cli import summarize_ledger
-from attention_manager.judge import run_judge
-from attention_manager.judge import verify
+from attention_manager.cli import format_ledger_summary, main, summarize_ledger
+from attention_manager.judge import run_judge, verify
 from attention_manager.queue import PacketQueue
 from attention_manager.state import SupervisorState
 from attention_manager.supervisor import Supervisor

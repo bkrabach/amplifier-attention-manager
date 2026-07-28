@@ -32,9 +32,20 @@ Two phases per pass:
   proposals file; a human applies/rejects them (Phase 1: nothing is applied
   automatically). Idempotent across passes via the proposals packet-id set.
 
-Phase-promotion data (design §Triage): ``recommendation_matched`` is RECORDED
-on the rule_delta ledger entry (did the human answer match the triage
-recommendation?) but never acted on — promotion automation is out of scope.
+Graduated trust (design §Triage, Phase 2 — build step 6):
+
+- ``recommendation_matched`` is recorded on the rule_delta ledger entry AND
+  acted on: a human answer matching the triage recommendation bumps the
+  streak of every rulebook section cited in ``triage.rule_refs``; 5
+  consecutive matches promote a section to Phase 2; any human override
+  demotes the cited sections to Phase 1 with streak 0, loudly (trust.py).
+- During the triage phase, a ``recommend`` verdict is AUTO-ANSWERED when ALL
+  conservative bounds hold: every cited rule resolves to a Phase-2 section
+  (and there is at least one), confidence is ``high``, and the packet's
+  urgency tier is not ``now``. The packet moves ``pending/`` → ``answered/``
+  (the canonical copy producers poll to unblock) and a review record lands in
+  ``queue/auto/`` for human calibration (``auto`` CLI). Any bound failing
+  falls back to the unchanged Phase-1 recommend flow.
 """
 
 from __future__ import annotations
@@ -46,15 +57,13 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from typing import TextIO
+from typing import Any, TextIO
 
-from .packet import Packet
-from .packet import Recommendation
-from .packet import Triage
+from . import trust
+from .autolog import AutoLog
+from .packet import Packet, Recommendation, Resolution, Triage, utc_now_iso
 from .queue import PacketQueue
-from .rulebook import SECTIONS
-from .rulebook import Rulebook
+from .rulebook import SECTIONS, Rulebook
 from .state import SupervisorState
 
 DEFAULT_BUNDLE_URI = "git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=bundles/triage.md"
@@ -66,6 +75,14 @@ MAX_ATTEMPTS = 2  # one retry max, each attempt logged loudly
 
 VALID_CONFIDENCE = ("low", "medium", "high")
 TRIAGE_HANDLED_BY = "manager-recommend"
+
+# Phase-2 auto-answer identity: triage.handled_by and resolution.answered_by
+# both carry it, so every consumer (producers, CLI, ledger) can tell an
+# auto-answer from a human or timeout answer at a glance.
+AUTO_ANSWERED_BY = "manager-auto"
+# The design's conservative auto-answer bound: never auto-answer a "now" packet.
+AUTO_EXCLUDED_TIER = "now"
+AUTO_REQUIRED_CONFIDENCE = "high"
 
 
 class VerdictError(ValueError):
@@ -235,6 +252,7 @@ class TriageRunner:
         # single-writer invariant on state.json).
         self.state = state or SupervisorState(home)
         self.queue = queue or PacketQueue()
+        self.autolog = AutoLog(self.queue.root)
         self.rulebook = rulebook or Rulebook(home=self.state.home)
         self.bundle_uri = bundle_uri or default_bundle_uri()
         self.amplifier_bin = amplifier_bin or default_amplifier_bin()
@@ -257,7 +275,7 @@ class TriageRunner:
         cmd = [self.amplifier_bin, "run", "-B", self.bundle_uri, prompt]
         try:
             with open(log_path, "w", encoding="utf-8") as log:
-                proc = subprocess.run(  # noqa: S603 — command is our own CLI invocation
+                proc = subprocess.run(
                     cmd,
                     cwd=work_dir,
                     stdout=log,
@@ -316,6 +334,12 @@ class TriageRunner:
 
         if verdict["decision"] == "recommend":
             rec = verdict["recommendation"]
+            # Phase 2 (graduated trust): auto-answer when EVERY conservative
+            # bound holds; any failure falls through to the unchanged Phase-1
+            # recommend flow.
+            auto_sections = self._auto_answer_sections(packet, rec, rule_refs)
+            if auto_sections is not None:
+                return self._auto_answer(packet, rec, rule_refs, why, auto_sections)
             # The triage recommendation always lives in triage.why; the packet's
             # recommendation field is only filled when the producer supplied none
             # (a producer recommendation is kept — both remain visible).
@@ -338,6 +362,9 @@ class TriageRunner:
             return Outcome(packet.id, "triage", "recommended", f"{rec['option']} ({rec['confidence']}): {why}")
 
         # bounce: failed the cold-reader test — move pending/ -> bounced/ with why.
+        return self._bounce(packet, verdict, why, rule_refs)
+
+    def _bounce(self, packet: Packet, verdict: dict[str, Any], why: str, rule_refs: list[str]) -> Outcome:
         bounce_reason: str = verdict["bounce_reason"]
         packet.triage = Triage(
             handled_by=TRIAGE_HANDLED_BY, rule_refs=rule_refs, why=f"{why} | bounce: {bounce_reason}"
@@ -348,6 +375,88 @@ class TriageRunner:
         self.state.append_event("triage:bounced", packet_id=packet.id, bounce_reason=bounce_reason, why=why)
         self.state.ledger_append("triage_bounced", packet_id=packet.id, bounce_reason=bounce_reason)
         return Outcome(packet.id, "triage", "bounced", bounce_reason)
+
+    # -- Phase-2 auto-answer (graduated trust; conservative bounds by design) ----
+
+    def _auto_answer_sections(self, packet: Packet, rec: dict[str, Any], rule_refs: list[str]) -> list[str] | None:
+        """Return the resolved phase-2 sections if the packet may be auto-answered.
+
+        ALL bounds must hold (conservative by design — any doubt means Phase-1
+        recommend flow):
+
+        - triage confidence is ``high``;
+        - the packet's urgency tier is not ``now``;
+        - there is at least ONE cited rule, and EVERY cited rule resolves to a
+          rulebook section that is currently Phase 2+ (an unresolvable ref
+          fails the bound — never guess).
+
+        Returns None when any bound fails.
+        """
+        if rec.get("confidence") != AUTO_REQUIRED_CONFIDENCE:
+            return None
+        if packet.urgency.tier == AUTO_EXCLUDED_TIER:
+            return None
+        if not rule_refs:
+            return None
+        sections: list[str] = []
+        for ref in rule_refs:
+            section = self.rulebook.resolve_ref_to_section(ref)
+            if section is None:
+                return None  # unresolvable ref — cannot prove phase-2 coverage
+            phase, _ = self.rulebook.get_section_state(section)
+            if phase < 2:
+                return None
+            if section not in sections:
+                sections.append(section)
+        return sections
+
+    def _auto_answer(
+        self, packet: Packet, rec: dict[str, Any], rule_refs: list[str], why: str, sections: list[str]
+    ) -> Outcome:
+        """Auto-answer a rule-covered packet (Phase 2).
+
+        File-op order (crash-safe, mirrors queue.answer()): write the resolved
+        packet to ``answered/`` FIRST — that is the canonical copy producers
+        poll to unblock — then remove ``pending/``, then append the review
+        record to ``queue/auto/``. answered/ is authoritative whenever it
+        exists (context/packet-schema.md).
+        """
+        triage_why = f"recommend {rec['option']} ({rec['confidence']}): {why}"
+        packet.triage = Triage(handled_by=AUTO_ANSWERED_BY, rule_refs=rule_refs, why=triage_why)
+        if packet.recommendation is None:
+            packet.recommendation = Recommendation(
+                option=rec["option"], rationale=rec["rationale"], confidence=rec["confidence"]
+            )
+        packet.resolution = Resolution(
+            answer=rec["option"],
+            answered_by=AUTO_ANSWERED_BY,
+            answered_at=utc_now_iso(),
+            rationale=why,
+        )
+        pending_path = self.queue.path_for(packet.id, "pending")
+        self.queue.write(packet, subdir="answered")  # canonical — producers unblock on this
+        pending_path.unlink(missing_ok=True)
+        self.autolog.append_record(
+            packet_id=packet.id, answer=rec["option"], why=why, rule_refs=rule_refs, sections=sections
+        )
+        self.state.append_event(
+            "triage:auto_answered",
+            packet_id=packet.id,
+            option=rec["option"],
+            confidence=rec["confidence"],
+            rule_refs=rule_refs,
+            sections=sections,
+            why=why,
+        )
+        self.state.ledger_append(
+            "triage_auto_answered",
+            packet_id=packet.id,
+            option=rec["option"],
+            sections=sections,
+            why=why,
+            recommendation_matched=None,  # no human answered — nothing to match against
+        )
+        return Outcome(packet.id, "triage", "auto_answered", f"{rec['option']} (phase-2 sections {sections}): {why}")
 
     # -- phase 2 of the pass: rule_delta proposals -------------------------------
 
@@ -361,8 +470,9 @@ class TriageRunner:
                 packet.id, "rule_delta", "error", "no valid verdict after retries (see rule_delta:error events)"
             )
 
-        # Phase-promotion DATA (recorded, never acted on): did the human's
-        # answer match the triage recommendation embedded in triage.why?
+        # Phase-promotion data (design §Triage): did the human's answer match
+        # the triage recommendation embedded in triage.why? Recorded on the
+        # ledger AND acted on (graduated trust — see _apply_trust below).
         matched: bool | None = None
         if packet.resolution is not None and packet.triage is not None and packet.triage.why:
             prefix = packet.triage.why.split(":", 1)[0]  # "recommend <opt> (<conf>)"
@@ -378,6 +488,7 @@ class TriageRunner:
             self.state.ledger_append(
                 "rule_delta_none", packet_id=packet.id, reason=verdict["reason"], recommendation_matched=matched
             )
+            self._apply_trust(packet, matched)
             return Outcome(packet.id, "rule_delta", "none", verdict["reason"])
 
         record = self.rulebook.append_proposal(
@@ -401,7 +512,35 @@ class TriageRunner:
             sentence=record["sentence"],
             recommendation_matched=matched,
         )
+        self._apply_trust(packet, matched)
         return Outcome(packet.id, "rule_delta", "proposed", f"[{record['section']}] {record['sentence']}")
+
+    # -- graduated trust: streak updates on HUMAN answers (design §Triage) --------
+
+    def _apply_trust(self, packet: Packet, matched: bool | None) -> None:
+        """Update the trust ladder from one newly-answered, triaged packet.
+
+        Only HUMAN answers move the ladder (auto/timeout answers carry no
+        calibration signal here — auto-answers are calibrated via ``auto
+        confirm``/``auto reject``), and only when triage actually recommended
+        (matched is None when it did not).
+
+        Runs AFTER the rule_delta proposal record is written: the record is
+        the shared idempotency key, so a crash between record and trust update
+        UNDER-counts (conservative) rather than double-counting a match.
+        """
+        if matched is None:
+            return
+        if packet.resolution is None or packet.resolution.answered_by != "human":
+            return
+        refs = list(packet.triage.rule_refs or []) if packet.triage is not None else []
+        sections = trust.sections_for_refs(self.rulebook, self.state, packet.id, refs)
+        if not sections:
+            return
+        if matched:
+            trust.record_match(self.rulebook, self.state, packet.id, sections, source="rule_delta")
+        else:
+            trust.record_override(self.rulebook, self.state, packet.id, sections, source="rule_delta", err=self._err)
 
     # -- the pass -----------------------------------------------------------------
 
@@ -433,6 +572,11 @@ class TriageRunner:
         for packet in self._scan("answered"):
             if packet.triage is None:
                 continue  # never triaged — rule_delta needs the triage why for calibration
+            if packet.resolution is not None and packet.resolution.answered_by == AUTO_ANSWERED_BY:
+                # Auto-answered: the rule that answered it already exists, so a
+                # rule_delta proposal is meaningless; calibration happens via
+                # the `auto confirm` / `auto reject` CLI instead.
+                continue
             if packet.id in proposed_ids:
                 continue  # already has a proposal record (incl. explicit 'none')
             outcomes.append(self._rule_delta_one(packet, rulebook_content))

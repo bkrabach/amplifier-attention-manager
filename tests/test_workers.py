@@ -11,6 +11,7 @@ import time
 import uuid
 
 import pytest
+
 from attention_manager import workers
 
 TMUX_PRESENT = shutil.which("tmux") is not None

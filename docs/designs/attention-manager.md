@@ -273,6 +273,11 @@ it is a mood."
 
 ## Triage — cold, graduated trust
 
+> **Status:** Phase 2 auto-answer is IMPLEMENTED (build step 6): per-section
+> phase/streak state lives in rulebook heading annotations, promotion/demotion
+> follows the operational rules below, and the `auto` CLI is the calibration
+> review loop over `queue/auto/`.
+
 - **Cold:** the triage agent reads **packet + rulebook only** — never the worker's
   context. "A reviewer sharing the writer's context always agrees with the writer."
   Cold triage doubles as packet validation: can't decide cold = malformed packet, bounce.
@@ -323,6 +328,7 @@ paying for."
 | D6 | **Blocked-on-human is owned, not inferred.** | We control the ApprovalProvider — the moment of blockage is our code; we emit `packet:created` ourselves. Tailing events.jsonl is the fallback for sessions we didn't launch. |
 | D7 | **Fail loud, no fallbacks.** | Undecidable triage surfaces with why. Undeclared timeout = pending + loud, never a quiet default. No synthetic "answers." |
 | D8 | **Triage shells out to the installed `amplifier` CLI (one-shot sessions), not embedded foundation.** | Keeps the root package stdlib-only (no git dependency on foundation), reuses the environment's existing provider config (host and DTU both have a working `amplifier`), and the file-based verdict protocol (session WRITES verdict JSON to a runner-provided path; missing/invalid verdict = loud `triage:error`, one logged retry max, never fabricated) keeps all state on disk (D5) with no stdout parsing. Embedded foundation remains the path when the manager later needs long-lived LLM sessions. |
+| D9 | **The recipe-gate poller (producer #4) shells out to `amplifier tool invoke recipes ...`, never patching the recipes tool.** | Same rationale family as D8: pure external adapter over the installed `amplifier` CLI (`operation=approvals` to discover gates, `operation=approve`/`deny` to forward answers), stdlib-only root package, gate dedupe tracked on disk (`recipe-gates.json`, idempotent across restarts, D5), invoke failures loud (`recipe_gates:error`, D7). |
 
 ## Reuse map (don't rebuild)
 

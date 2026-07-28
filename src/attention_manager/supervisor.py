@@ -5,9 +5,12 @@ Each tick (default 2s):
 0. (once, at startup) Acquire the single-instance flock on
    ``<home>/supervisor.lock`` — at most ONE supervise loop per home, ever.
    A second supervisor fails loud instead of silently duplicating events.
-1. Re-scan the packet queue (pending/ + answered/ + auto/) and diff against
+1. Re-scan the packet queue (pending/ + answered/) and diff against
    the seen-sets → emit ``packet:created`` / ``packet:answered`` events,
    enqueue created packets for notification batching, write ledger entries.
+   (``auto/`` holds Phase-2 REVIEW RECORDS, not packets — the canonical copy
+   of an auto-answered packet lives in ``answered/``, so scanning answered/
+   already covers it; see context/packet-schema.md.)
 2. Observe workers (tmux liveness + log sentinel) → emit ``worker:started``
    (once) / ``worker:finished`` (sentinel or dead session). When the worker's
    meta carries a ``judge_cmd`` (design §The Judge Requirement, step 4), the
@@ -42,29 +45,27 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-from typing import TextIO
+from typing import Any, TextIO
 
 from . import workers as workers_mod
-from .judge import DEFAULT_JUDGE_TIMEOUT_S
-from .judge import JudgeResult
-from .judge import run_judge
-from .notify import NotificationBatcher
-from .notify import parse_sink
+from .judge import DEFAULT_JUDGE_TIMEOUT_S, JudgeResult, run_judge
+from .notify import NotificationBatcher, parse_sink
 from .packet import Packet
 from .queue import PacketQueue
+from .recipe_gates import RecipeGatePoller
 from .state import SupervisorState
 from .triage import TriageRunner
 from .workers import Observation
 
 DEFAULT_INTERVAL_S = 2.0
 DEFAULT_TRIAGE_EVERY_TICKS = 15
+DEFAULT_RECIPES_EVERY_TICKS = 5
 LOCK_FILENAME = "supervisor.lock"
 
 
 def _parse_iso(ts: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)  # 3.11+ accepts the 'Z' suffix natively
     except ValueError:
         return None
 
@@ -97,6 +98,8 @@ class Supervisor:
         observe: Callable[[str, Path], Observation] | None = None,
         triage_every: int | None = None,
         triage_runner: TriageRunner | None = None,
+        recipes_every: int | None = None,
+        recipe_poller: RecipeGatePoller | None = None,
         judge_timeout_s: float = DEFAULT_JUDGE_TIMEOUT_S,
         err: TextIO | None = None,
     ):
@@ -118,6 +121,12 @@ class Supervisor:
         self.triage_runner = triage_runner
         if self.triage_every is not None and self.triage_runner is None:
             self.triage_runner = TriageRunner(queue=self.queue, state=self.state, err=self._err)
+        # Recipe-gate poller (design producer #4, D9). OFF by default:
+        # recipes_every = run one poll every N ticks when set.
+        self.recipes_every = recipes_every
+        self.recipe_poller = recipe_poller
+        if self.recipes_every is not None and self.recipe_poller is None:
+            self.recipe_poller = RecipeGatePoller(queue=self.queue, state=self.state, err=self._err)
         self._tick_count = 0
 
         self.batcher: NotificationBatcher | None = None
@@ -130,9 +139,11 @@ class Supervisor:
             self.batcher = NotificationBatcher(sink=parse_sink(notify_spec), **kwargs)
 
         if not self.state.loaded_from_snapshot:
-            # D5 rebuild path: no snapshot — reseed seen-sets from the queue dirs.
+            # D5 rebuild path: no snapshot — reseed seen-sets from the queue
+            # dirs. auto/ holds review records (not packets) since Phase 2;
+            # every auto-answered packet's canonical copy is in answered/.
             pending = [p.id for p in self._scan_subdir("pending")]
-            answered = [p.id for p in self._scan_subdir("answered")] + [p.id for p in self._scan_subdir("auto")]
+            answered = [p.id for p in self._scan_subdir("answered")]
             counts = self.state.rebuild_seen_from_queue(pending, answered)
             self.state.append_event("state:rebuilt", **counts)
 
@@ -155,7 +166,7 @@ class Supervisor:
 
     def _scan_packets(self) -> None:
         pending = self._scan_subdir("pending")
-        answered = self._scan_subdir("answered") + self._scan_subdir("auto")
+        answered = self._scan_subdir("answered")  # auto-answered packets land here too (canonical)
 
         for pkt in pending:
             if pkt.id in self.state.seen_pending:
@@ -391,7 +402,7 @@ class Supervisor:
                 "state.json (single-writer invariant) — stop the other process first."
             ) from e
         os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        os.write(fd, f"{os.getpid()}\n".encode())
         self._lock_fd = fd
 
     def _release_instance_lock(self) -> None:
@@ -422,17 +433,37 @@ class Supervisor:
             self.state.append_event("triage:error", error=f"triage pass crashed: {e}")
             print(f"ERROR: triage pass crashed: {e}", file=self._err)
 
+    # -- recipe-gate polling (design producer #4, D9) -----------------------------------
+
+    def _maybe_recipes(self) -> None:
+        """Run one recipe-gate poll every ``recipes_every`` ticks (first tick counts).
+
+        Per-gate failures are handled (loudly) inside the poller; anything
+        that escapes here is a system failure — reported loud, loop keeps
+        running (non-interference, same discipline as triage).
+        """
+        if self.recipes_every is None or self.recipe_poller is None:
+            return
+        if self._tick_count % self.recipes_every != 0:
+            return
+        try:
+            self.recipe_poller.poll_once()
+        except Exception as e:  # noqa: BLE001 — boundary: keep the loop alive, loudly
+            self.state.append_event("recipe_gates:error", error=f"recipe-gate poll crashed: {e}")
+            print(f"ERROR: recipe-gate poll crashed: {e}", file=self._err)
+
     # -- the loop --------------------------------------------------------------------
 
     def tick(self) -> None:
         self._scan_packets()
         self._observe_workers()
         self._maybe_triage()
+        self._maybe_recipes()
         self._tick_count += 1
         self._flush_notifications()
         self.state.save()
 
-    def _handle_signal(self, signum: int, frame: Any) -> None:  # noqa: ARG002
+    def _handle_signal(self, signum: int, frame: Any) -> None:
         self._stop = True
 
     def run(self, once: bool = False) -> int:
@@ -444,6 +475,8 @@ class Supervisor:
             workers_mod.require_tmux()  # fail loud upfront — no tmux, no supervision
             if self.triage_runner is not None and self.triage_every is not None:
                 self.triage_runner.preflight()  # fail loud upfront — no amplifier bin, no triage
+            if self.recipe_poller is not None and self.recipes_every is not None:
+                self.recipe_poller.preflight()  # fail loud upfront — no amplifier bin, no gate polling
             if self.batcher is None:
                 self._warn_notifications_disabled()
             self.state.append_event(
@@ -453,6 +486,7 @@ class Supervisor:
                 queue_root=str(self.queue.root),
                 notify=self.batcher.sink.name if self.batcher is not None else None,
                 triage_every=self.triage_every,
+                recipes_every=self.recipes_every,
             )
             if once:
                 self.tick()

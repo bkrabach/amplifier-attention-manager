@@ -2,10 +2,7 @@
 
 import pytest
 
-from attention_manager.rulebook import DEFAULT_TOKEN_CAP
-from attention_manager.rulebook import SECTIONS
-from attention_manager.rulebook import Rulebook
-from attention_manager.rulebook import approx_tokens
+from attention_manager.rulebook import DEFAULT_TOKEN_CAP, SECTIONS, Rulebook, approx_tokens
 
 
 @pytest.fixture

@@ -5,14 +5,10 @@ writes packets with its own minimal IO, and the background thread answers via
 the ROOT attention_manager queue library against the same files.
 """
 
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
-from unittest.mock import AsyncMock
-from unittest.mock import MagicMock
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
-from amplifier_module_tool_request_decision import RequestDecisionTool
-from amplifier_module_tool_request_decision import mount
+from amplifier_module_tool_request_decision import RequestDecisionTool, mount
 
 from attention_manager.queue import PacketQueue
 
@@ -139,7 +135,7 @@ class TestTimeouts:
 
     async def test_declared_apply_option_default_at_deadline(self, queue_root):
         tool = RequestDecisionTool(config={"poll_interval_s": 0.05, "max_wait_seconds": 30})
-        deadline = _iso(datetime.now(timezone.utc) + timedelta(seconds=0.2))
+        deadline = _iso(datetime.now(UTC) + timedelta(seconds=0.2))
         result = await tool.execute(
             {
                 "question": "A or B?",
@@ -159,7 +155,7 @@ class TestTimeouts:
 
     async def test_declared_fail_loud_at_deadline(self, queue_root):
         tool = RequestDecisionTool(config={"poll_interval_s": 0.05, "max_wait_seconds": 30})
-        deadline = _iso(datetime.now(timezone.utc) + timedelta(seconds=0.2))
+        deadline = _iso(datetime.now(UTC) + timedelta(seconds=0.2))
         result = await tool.execute(
             {
                 "question": "A or B?",
