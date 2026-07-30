@@ -46,6 +46,12 @@ escalates (packet lands) or a loop fails, its session bell rings —
 muxplex UI) clear bells; the manager never does. Hop into any session from the
 browser at any time — the manager won't fight you for the view.
 
+NOTE: muxplex views filter what surfaces. If your active view is a curated one
+(not "all"), belled `am-*` sessions won't appear in it — add them to the view
+you dogfood from (or use "all"). The bell state itself is always there
+(host-verified: `GET /api/sessions` shows `bell.unseen_count`/`last_fired_at`
+for `am-*` sessions the moment the manager rings).
+
 Answer escalations on your schedule, cold, from the packet alone:
 
 ```bash
