@@ -70,8 +70,14 @@ def make_packet(question: str = "A or B?", session_id: str | None = None) -> Pac
 
 
 def make_supervisor(home, queue, sessions=None, observations=None, ring=None, **kwargs) -> Supervisor:
-    """Supervisor with injected (no-tmux) worker + ring backends."""
+    """Supervisor with injected (no-tmux) worker + ring backends.
+
+    Creates a workers/<session>/ dir for each injected session — adoption is
+    HOME-SCOPED (D10): only sessions dispatched by this home are ours.
+    """
     observations = observations or {}
+    for session in sessions or []:
+        (Path(home) / "workers" / session).mkdir(parents=True, exist_ok=True)
     return Supervisor(
         home=home,
         queue=queue,

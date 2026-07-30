@@ -91,6 +91,16 @@ class TestExecuteHappyPath:
         result = await tool.execute({"question": "A or B?", "options": OPTIONS})
         packet = PacketQueue(queue_root).get(_out(result)["packet_id"])
         assert packet.source.session_id == "sess-42"
+        # links.resume is REAL when the session id is known (the contract's
+        # re-entry link — how the blocked turn is re-driven after answering).
+        assert packet.links["resume"] == "amplifier session resume sess-42"
+
+    async def test_links_resume_absent_without_session_id(self, queue_root, answer_when_pending):
+        tool = RequestDecisionTool(config=FAST)  # no coordinator — no session id
+        answer_when_pending(queue_root, "A")
+        result = await tool.execute({"question": "A or B?", "options": OPTIONS})
+        packet = PacketQueue(queue_root).get(_out(result)["packet_id"])
+        assert packet.links == {}  # producer-dependent: absent, never fabricated
 
 
 class TestValidation:

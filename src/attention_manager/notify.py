@@ -43,7 +43,7 @@ class BatchItem:
     question: str
     ts: str  # wall-clock ISO, for the delivered payload
     enqueued_at: float  # monotonic, for the window policy
-    kind: str = "packet"  # "packet" | "finish_line" | "finish_line_failed"
+    kind: str = "packet"  # "packet" | "finish_line" | "finish_line_failed" | "worker_failed"
 
 
 class Sink(Protocol):

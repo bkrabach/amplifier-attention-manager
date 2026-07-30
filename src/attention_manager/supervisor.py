@@ -288,6 +288,32 @@ class Supervisor:
                 )
                 if judge_result is not None:
                     self._report_judge_outcome(session, record, obs.exit_code, judge_result)
+                elif obs.exit_code != 0 or not obs.sentinel_seen:
+                    # Unjudged death is NOT allowed to be silent (defect: a
+                    # worker dying rc=1 produced zero signal while its judged
+                    # twin got a loud LOOP FAILED). exit_code None (dead
+                    # session, no sentinel) counts as failure too. Unjudged
+                    # exit-0 stays quiet — that is success.
+                    self._report_unjudged_failure(session, record, obs)
+
+    def _report_unjudged_failure(self, session: str, record: dict[str, Any], obs: Observation) -> None:
+        """Loud unjudged worker failure: event + ledger + stderr + notify + bell.
+
+        Fires at most once per worker by construction: the persisted
+        ``finished`` flag gates re-observation (across restarts too), exactly
+        like loop:failed.
+        """
+        name = record.get("name")
+        reason = f"worker exited {obs.exit_code}" if obs.sentinel_seen else "session died without an exit sentinel"
+        self.state.append_event("worker:failed", session=session, name=name, exit_code=obs.exit_code, reason=reason)
+        self.state.ledger_append("worker_failed", session=session, name=name, exit_code=obs.exit_code, reason=reason)
+        print(f"ERROR: worker failed (unjudged): {session} — {reason}", file=self._err)
+        if self.batcher is not None:
+            self.batcher.enqueue(session, f"WORKER FAILED: {name} — {reason}", kind="worker_failed")
+        else:
+            self._warn_notifications_disabled()
+        if self.bells:
+            self._try_ring(session, trigger="worker_failed")
 
     # -- judge-gated finish lines (design §The Judge Requirement, step 4) -----------
 

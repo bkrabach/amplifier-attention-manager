@@ -240,6 +240,13 @@ class SupervisorState:
         workers/ meta.json is the metadata source of truth; tmux tells liveness.
         Already-tracked sessions keep their flags (started/finished/exit_code).
         Returns the list of newly adopted session names.
+
+        HOME-SCOPED (v1 scope: one home per human): only sessions dispatched
+        by THIS home — i.e. with a ``workers/<session>/`` dir under it — are
+        adopted. am-* tmux sessions belonging to other homes on the same tmux
+        server are another home's business: ignored, not even warned.
+        (Defect: a global am-* sweep put one persona's workers in another
+        persona's status and "what landed today" ledger.)
         """
         added: list[str] = []
 
@@ -267,8 +274,13 @@ class SupervisorState:
         for session in tmux_sessions:
             if not session.startswith(SESSION_PREFIX) or session in self.workers:
                 continue
-            # am-* session with no workers/ dir: not launched by us; adopt it
-            # anyway (the am-* prefix is the design's ownership convention).
+            if not (self.workers_dir / session).is_dir():
+                # Not dispatched by this home (no workers/<session>/ dir) —
+                # another home's worker on a shared tmux server. Ignore.
+                continue
+            # Ours (the dir exists) but meta.json is missing/corrupt: adopt
+            # with the honest adopted_without_meta flag so observation and
+            # cleanup still cover it.
             self.workers[session] = new_worker_record(
                 name=session.removeprefix(SESSION_PREFIX),
                 session=session,

@@ -51,6 +51,14 @@ SESSION_ID_RE = re.compile(r"Session ID:\s*([0-9a-fA-F][0-9a-fA-F-]{7,})")
 # Found by DTU eval S4: session ids never extracted for real workers, so the
 # packet↔worker bell join never bound and no bell rang (silently).
 ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+# Bundle/module load failures kill a worker in ~2s, before any LLM turn.
+# dispatch's early-death check greps the log for these. Observed live (UX
+# round 1, two personas independently): "Error: Bundle '<uri>' not found.
+# Available bundles: ...". Kept deliberately narrow — a pattern that matches
+# ordinary worker output would turn honest fast successes into false alarms.
+LOAD_FAILURE_RE = re.compile(
+    r"(?:bundle|module)\s+'[^']*'\s+not\s+found|failed to (?:load|resolve) (?:bundle|module)", re.IGNORECASE
+)
 
 
 def require_tmux() -> str:

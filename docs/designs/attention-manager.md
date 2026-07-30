@@ -203,9 +203,9 @@ packet:
     confidence: medium
   context: |                        # BOUNDED decision material, inline
     <the minimal facts needed to decide — not a transcript>
-  links:
-    resume: amplifier session resume <id>
-    files: [path1, path2]
+  links:                            # producers FILL resume when the producing
+    resume: amplifier session resume <id>   # session id is known (tool-request-decision,
+    files: [path1, path2]                   # hooks-packet-approval); producer-dependent otherwise
   urgency:
     tier: batch | today | now       # "now" is rare and must justify itself
     deadline: 2026-07-27T00:00:00Z  # optional
@@ -245,6 +245,11 @@ from notifications to decisions.
   sources of truth, one of them in your head. The manager's post-answer step always asks
   "what rule change does this answer imply?" — even if the answer is "none, genuinely
   one-off" (logged as such).
+  - *Implementation note (dogfood defect fixed):* "always" means UNCONDITIONAL on
+    triage — every human-answered packet gets a rule_delta pass, including packets
+    answered before any successful triage pass. Triage fields are optional enrichment
+    (they only add the recommendation-match calibration signal). Auto answers calibrate
+    via `auto confirm`/`auto reject` instead; timeout-defaults carry no human preference.
 - **Disagreement = ambiguity:** if triage and human disagree, or a rule is cited in 3+
   packets, that's one badly written rule, not N problems. Rewrite the sentence.
 - **Placement (from review):** @mention the rulebook in the **triage agent's** `.md`
@@ -329,6 +334,7 @@ paying for."
 | D7 | **Fail loud, no fallbacks.** | Undecidable triage surfaces with why. Undeclared timeout = pending + loud, never a quiet default. No synthetic "answers." |
 | D8 | **Triage shells out to the installed `amplifier` CLI (one-shot sessions), not embedded foundation.** | Keeps the root package stdlib-only (no git dependency on foundation), reuses the environment's existing provider config (host and DTU both have a working `amplifier`), and the file-based verdict protocol (session WRITES verdict JSON to a runner-provided path; missing/invalid verdict = loud `triage:error`, one logged retry max, never fabricated) keeps all state on disk (D5) with no stdout parsing. Embedded foundation remains the path when the manager later needs long-lived LLM sessions. |
 | D9 | **The recipe-gate poller (producer #4) shells out to `amplifier tool invoke recipes ...`, never patching the recipes tool.** | Same rationale family as D8: pure external adapter over the installed `amplifier` CLI (`operation=approvals` to discover gates, `operation=approve`/`deny` to forward answers), stdlib-only root package, gate dedupe tracked on disk (`recipe-gates.json`, idempotent across restarts, D5), invoke failures loud (`recipe_gates:error`, D7). |
+| D10 | **Worker adoption is HOME-SCOPED (v1: one home per human, one machine per person).** | The supervisor/status adopt only `am-*` sessions dispatched by THIS home (they have a `workers/<session>/` dir under it). A global am-* tmux sweep put one user's workers in another user's status and daily ledger on a shared tmux server (UX round 1). Other homes' sessions are ignored — not even warned; they are another home's business. Shared hosts are out of scope for v1. |
 
 ## Reuse map (don't rebuild)
 
@@ -385,8 +391,13 @@ attention-manager/
 ## Metrics & proof gate
 
 **Metrics (all from queue/ledger files — the queue generates its own telemetry):**
+- **Work unit (definition):** one dispatched worker or one workunit-run pipeline — one
+  `dispatched`/`workunit_finished` ledger entry = one unit.
 - **Escalations per work unit — must FALL week over week.** The measurable difference
-  between "attention firewall for sessions" and "snooze button."
+  between "attention firewall for sessions" and "snooze button." Computed by
+  `ledger --summary` (ISO week vs previous, from ledger/*.jsonl). METRIC INTEGRITY:
+  failed units (`loop_failed` + `worker_failed`) are shown separately and EXCLUDED from
+  the healthy denominator — failures can never improve the number.
 - Time-to-re-entry per packet (created → answered), split by tier.
 - Loops closed per day (ledger), visible to the human.
 - Auto-triage precision (spot-check of `queue/auto/` why-log).

@@ -23,8 +23,7 @@ import json
 import logging
 import os
 import secrets
-from datetime import datetime
-from datetime import timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +49,7 @@ def _queue_root() -> Path:
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _iso(dt: datetime) -> str:
@@ -232,9 +231,13 @@ class RequestDecisionTool:
         root = _queue_root()
         urgency_in = input_data.get("urgency") or {}
         source: dict[str, Any] = {"kind": "decision"}
+        links: dict[str, Any] = {}
         session_id = getattr(self._coordinator, "session_id", None)
         if session_id:
             source["session_id"] = str(session_id)
+            # The re-entry link the packet contract promises: how a human (or
+            # the manager) re-drives the blocked worker turn after answering.
+            links["resume"] = f"amplifier session resume {session_id}"
 
         packet: dict[str, Any] = {
             "id": _new_packet_id(),
@@ -244,7 +247,7 @@ class RequestDecisionTool:
             "question": input_data["question"],
             "options": input_data["options"],
             "context": input_data.get("context", ""),
-            "links": {},
+            "links": links,
             "urgency": {
                 "tier": urgency_in.get("tier", "batch"),
                 **{k: v for k, v in urgency_in.items() if k != "tier"},

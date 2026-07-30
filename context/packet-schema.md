@@ -43,6 +43,10 @@ packet must never be observable under its final name.
    packet to `answered/<id>.json` (atomic), then removes `pending/<id>.json`.
    - A crash between the two steps leaves both files present; **`answered/` is
      authoritative** whenever it exists.
+   - **Human override on bounces:** a packet in `bounced/` may also be
+     answered (same validation, same atomic move `bounced/` → `answered/`).
+     A triage bounce must never leave the human without recourse; producers
+     polling `answered/` unblock identically either way.
 3. Producer sees `answered/<id>.json`, reads `resolution`, unblocks.
 
 **`answered/` is canonical for auto-answered packets too.** A Phase-2

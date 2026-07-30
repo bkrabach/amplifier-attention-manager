@@ -53,15 +53,11 @@ import json
 import logging
 import os
 import secrets
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from amplifier_core import ApprovalRequest
-from amplifier_core import ApprovalResponse
-from amplifier_core import HookResult
+from amplifier_core import ApprovalRequest, ApprovalResponse, HookResult
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +89,7 @@ def _queue_root() -> Path:
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _iso(dt: datetime) -> str:
@@ -145,8 +141,9 @@ def _bounded_context(request: ApprovalRequest) -> str:
 class PacketApprovalProvider:
     """ApprovalProvider that serializes permission gates as queue packets."""
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(self, config: dict[str, Any] | None = None, coordinator: Any = None):
         config = config or {}
+        self._coordinator = coordinator
         raw_max_wait = config.get("max_wait_seconds")
         self.max_wait_seconds: float | None = float(raw_max_wait) if raw_max_wait is not None else None
         self.poll_interval_s = float(config.get("poll_interval_s", DEFAULT_POLL_INTERVAL_S))
@@ -161,18 +158,27 @@ class PacketApprovalProvider:
             # timeout action is fail-loud (deny, with an explicit reason).
             urgency["deadline"] = _iso(now + timedelta(seconds=request.timeout))
             urgency["on_timeout"] = {"action": "fail-loud"}
+        source: dict[str, Any] = {"kind": "permission"}
+        links: dict[str, Any] = {}
+        # Provenance + re-entry, when cheaply available (same getattr pattern
+        # as tool-request-decision). Absent a coordinator session id, links
+        # stays empty — links.resume is producer-dependent by contract.
+        session_id = getattr(self._coordinator, "session_id", None)
+        if session_id:
+            source["session_id"] = str(session_id)
+            links["resume"] = f"amplifier session resume {session_id}"
         return {
             "id": _new_packet_id(),
             "created_at": _iso(now),
             "schema_version": SCHEMA_VERSION,
-            "source": {"kind": "permission"},
+            "source": source,
             "question": f"Allow or deny: {request.action}",
             "options": [
                 {"id": "allow", "label": "Allow", "consequence": f"'{request.tool_name}' proceeds"},
                 {"id": "deny", "label": "Deny", "consequence": f"'{request.tool_name}' is blocked"},
             ],
             "context": _bounded_context(request),
-            "links": {},
+            "links": links,
             "urgency": urgency,
         }
 
@@ -235,7 +241,7 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> dict[
     modules have mounted, so mount order cannot matter).
     """
     config = config or {}
-    provider = PacketApprovalProvider(config)
+    provider = PacketApprovalProvider(config, coordinator=coordinator)
     coordinator.register_capability(PROVIDER_CAPABILITY, provider)
     logger.info("hooks-packet-approval mounted: registered capability %s", PROVIDER_CAPABILITY)
 

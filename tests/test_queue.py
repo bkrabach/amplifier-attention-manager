@@ -85,18 +85,54 @@ class TestAnswer:
         # packet untouched, still pending
         assert queue.locate(packet.id)[0] == "pending"
 
-    def test_answer_rejects_non_pending_packet(self, queue_root):
+    def test_answer_rejects_already_answered_packet(self, queue_root):
         queue = PacketQueue(queue_root)
         packet = make_packet()
         queue.write(packet)
         queue.answer(packet.id, "A")
-        with pytest.raises(ValueError, match="not pending"):
+        with pytest.raises(ValueError, match="not pending/ or bounced/"):
             queue.answer(packet.id, "B")
 
     def test_answer_unknown_id_raises_keyerror(self, queue_root):
         queue = PacketQueue(queue_root)
         with pytest.raises(KeyError, match="pkt-nope"):
             queue.answer("pkt-nope", "A")
+
+
+class TestBouncedOverride:
+    """Human override on triage bounces: answering a bounced packet reclaims
+    the decision in one command (defect: recovery depended on the worker
+    re-arguing its own packet — fail-loud was inverted)."""
+
+    def _bounce(self, queue: PacketQueue) -> Packet:
+        packet = make_packet()
+        queue.write(packet)
+        bounced_path = queue.path_for(packet.id, "bounced")
+        queue.write(packet, subdir="bounced")
+        queue.path_for(packet.id, "pending").unlink()
+        assert bounced_path.exists()
+        return packet
+
+    def test_answer_bounced_moves_to_answered(self, queue_root):
+        queue = PacketQueue(queue_root)
+        packet = self._bounce(queue)
+        answered = queue.answer(packet.id, "B", rationale="human override on the bounce")
+        assert answered.resolution is not None and answered.resolution.answered_by == "human"
+        assert queue.locate(packet.id)[0] == "answered"
+        assert not queue.path_for(packet.id, "bounced").exists()
+
+    def test_answer_bounced_validates_option(self, queue_root):
+        queue = PacketQueue(queue_root)
+        packet = self._bounce(queue)
+        with pytest.raises(ValueError, match="not one of packet"):
+            queue.answer(packet.id, "Z")
+        assert queue.locate(packet.id)[0] == "bounced"  # untouched
+
+    def test_list_bounced(self, queue_root):
+        queue = PacketQueue(queue_root)
+        packet = self._bounce(queue)
+        assert [p.id for p in queue.list_bounced()] == [packet.id]
+        assert queue.list_pending() == []
 
 
 class TestAwaitResolution:

@@ -35,8 +35,14 @@ def make_packet(question: str = "A or B?") -> Packet:
 
 
 def make_supervisor(home, queue, sessions=None, observations=None, **kwargs) -> Supervisor:
-    """Supervisor with an injected (no-tmux) worker backend."""
+    """Supervisor with an injected (no-tmux) worker backend.
+
+    Creates a workers/<session>/ dir for each injected session — adoption is
+    HOME-SCOPED (D10): only sessions dispatched by this home are ours.
+    """
     observations = observations or {}
+    for session in sessions or []:
+        (Path(home) / "workers" / session).mkdir(parents=True, exist_ok=True)
     return Supervisor(
         home=home,
         queue=queue,
@@ -168,6 +174,108 @@ class TestWorkerLifecycle:
         sup = make_supervisor(home, queue, sessions=["am-w1"], observations=observations)
         sup.tick()
         assert sup.state.workers["am-w1"]["amplifier_session_id"] == "abc-123-def"
+
+
+class TestUnjudgedFailureIsLoud:
+    """Defect (UX round 1): an unjudged worker dying rc=1 produced ZERO signal
+    while its judged twin got a loud LOOP FAILED. Unjudged failure is now loud:
+    worker:failed event + worker_failed ledger + notify (kind worker_failed) +
+    bell (trigger worker_failed). Unjudged exit-0 stays quiet — that's success."""
+
+    def _sup(self, home, queue, obs, rings, **kwargs):
+        sup = make_supervisor(
+            home,
+            queue,
+            sessions=["am-w1"],
+            observations={"am-w1": obs},
+            ring=rings.append,
+            **kwargs,
+        )
+        return sup
+
+    def test_nonzero_exit_unjudged_is_loud(self, home, queue, capsys):
+        rings: list[str] = []
+        obs = Observation(alive=False, exit_code=3, sentinel_seen=True, session_id=None)
+        sup = self._sup(home, queue, obs, rings, notify_spec="console", batch_window_s=0.0)
+        sup.tick()
+        sup.tick()  # finished workers are not re-observed — everything fires ONCE
+
+        failed = events_of(sup, "worker:failed")
+        assert len(failed) == 1
+        assert failed[0]["exit_code"] == 3 and "exited 3" in failed[0]["reason"]
+        ledger = [e for e in sup.state.ledger_read() if e["kind"] == "worker_failed"]
+        assert len(ledger) == 1 and ledger[0]["session"] == "am-w1"
+        # Bell rang with the worker_failed trigger, exactly once.
+        assert rings == ["am-w1"]
+        rung = events_of(sup, "bell:rung")
+        assert len(rung) == 1 and rung[0]["trigger"] == "worker_failed"
+        # Notification enqueued with the worker_failed kind (console sink prints it).
+        out = capsys.readouterr().out
+        assert "WORKER FAILED" in out and "[worker_failed]" in out
+
+    def test_dead_session_without_sentinel_is_worker_failed(self, home, queue):
+        rings: list[str] = []
+        obs = Observation(alive=False, exit_code=None, sentinel_seen=False, session_id=None)
+        sup = self._sup(home, queue, obs, rings)
+        sup.tick()
+        failed = events_of(sup, "worker:failed")
+        assert len(failed) == 1
+        assert "without an exit sentinel" in failed[0]["reason"]
+        assert rings == ["am-w1"]
+
+    def test_unjudged_exit_zero_stays_quiet(self, home, queue):
+        rings: list[str] = []
+        obs = Observation(alive=False, exit_code=0, sentinel_seen=True, session_id=None)
+        sup = self._sup(home, queue, obs, rings)
+        sup.tick()
+        assert events_of(sup, "worker:failed") == []
+        assert rings == []
+        assert [e for e in sup.state.ledger_read() if e["kind"] == "worker_failed"] == []
+
+    def test_judged_failure_is_loop_failed_not_worker_failed(self, home, queue):
+        """A judged worker's failure is the judge's story (loop:failed) —
+        never double-reported as worker_failed."""
+        rings: list[str] = []
+        obs = Observation(alive=False, exit_code=1, sentinel_seen=True, session_id=None)
+        sup = self._sup(home, queue, obs, rings)
+        sup.state.adopt_workers(["am-w1"])
+        sup.state.workers["am-w1"]["judge_cmd"] = "false"  # judge fails
+        sup.tick()
+        assert events_of(sup, "worker:failed") == []
+        assert len(events_of(sup, "loop:failed")) == 1
+        rung = events_of(sup, "bell:rung")
+        assert [e["trigger"] for e in rung] == ["loop_failed"]
+
+    def test_bells_off_suppresses_worker_failed_ring(self, home, queue):
+        rings: list[str] = []
+        obs = Observation(alive=False, exit_code=2, sentinel_seen=True, session_id=None)
+        sup = self._sup(home, queue, obs, rings, bells=False)
+        sup.tick()
+        assert len(events_of(sup, "worker:failed")) == 1  # still loud on event/ledger
+        assert rings == []
+
+
+class TestHomeScopedAdoption:
+    """D10: only sessions dispatched by THIS home (workers/<session>/ dir under
+    it) are adopted. Another home's am-* sessions on the same tmux server must
+    never appear in this home's status, events, or ledger."""
+
+    def test_foreign_am_session_is_ignored(self, home, queue):
+        sup = Supervisor(
+            home=home,
+            queue=queue,
+            list_sessions=lambda: ["am-someone-elses"],
+            observe=lambda s, log: Observation(alive=True, exit_code=None, sentinel_seen=False, session_id=None),
+        )
+        sup.tick()
+        assert "am-someone-elses" not in sup.state.workers
+        assert events_of(sup, "worker:started") == []
+
+    def test_own_session_with_dir_is_adopted(self, home, queue):
+        sup = make_supervisor(home, queue, sessions=["am-mine"])  # helper creates the dir
+        sup.tick()
+        assert "am-mine" in sup.state.workers
+        assert len(events_of(sup, "worker:started")) == 1
 
 
 class TestNotificationWiring:

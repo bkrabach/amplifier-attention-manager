@@ -36,7 +36,8 @@ import argparse
 import json
 import os
 import sys
-from datetime import UTC, datetime
+import time
+from datetime import UTC, date, datetime
 
 from . import trust, workers, workunit
 from .autolog import AutoLog
@@ -78,19 +79,38 @@ def _truncate(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "\u2026"
 
 
+def _packet_source_label(p: Packet) -> str:
+    """Which worker/unit raised this packet — from packet data alone."""
+    return p.source.work_unit or p.source.muxplex_session or "-"
+
+
 def _cmd_queue_list(queue: PacketQueue, as_json: bool) -> int:
+    # Bounced packets are LISTED (marked BOUNCED) so a triage bounce is never
+    # invisible to a human who doesn't know to look in bounced/ — and they
+    # are reclaimable via `answer <id> <option>` (human override).
     pending = queue.list_pending()
+    bounced = queue.list_bounced()
     if as_json:
-        print(json.dumps([p.to_dict() for p in pending], indent=2))
+        rows = [{**p.to_dict(), "queue_subdir": "pending"} for p in pending]
+        rows += [{**p.to_dict(), "queue_subdir": "bounced"} for p in bounced]
+        print(json.dumps(rows, indent=2))
         return 0
-    if not pending:
-        print("queue empty (no pending packets)")
+    if not pending and not bounced:
+        print("queue empty (no pending or bounced packets)")
         return 0
-    header = f"{'ID':<26} {'KIND':<14} {'TIER':<6} {'AGE':<5} QUESTION"
+    header = f"{'ID':<26} {'KIND':<14} {'TIER':<6} {'AGE':<5} {'SOURCE':<14} QUESTION"
     print(header)
     print("-" * len(header))
     for p in pending:
-        print(f"{p.id:<26} {p.source.kind:<14} {p.urgency.tier:<6} {_age(p.created_at):<5} {_truncate(p.question, 60)}")
+        print(
+            f"{p.id:<26} {p.source.kind:<14} {p.urgency.tier:<6} {_age(p.created_at):<5} "
+            f"{_truncate(_packet_source_label(p), 14):<14} {_truncate(p.question, 60)}"
+        )
+    for p in bounced:
+        print(
+            f"{p.id:<26} {'BOUNCED':<14} {p.urgency.tier:<6} {_age(p.created_at):<5} "
+            f"{_truncate(_packet_source_label(p), 14):<14} {_truncate(p.question, 60)}"
+        )
     return 0
 
 
@@ -123,6 +143,42 @@ def _cmd_answer(queue: PacketQueue, packet_id: str, option: str, rationale: str 
     return 0
 
 
+# Post-launch early-death window: long enough for a bundle/module load failure
+# to kill the worker (observed ~2s live), short enough not to hurt dispatch UX.
+DISPATCH_EARLY_DEATH_WAIT_S = 3.0
+
+
+def _early_death_warning(session: str, log_path) -> str | None:
+    """Post-launch early-death check. Returns a loud message, or None (fine).
+
+    Defect (UX round 1, two personas independently): `dispatch` printed
+    "dispatched am-X" / exit 0 while the worker died in ~2s on a bundle load
+    failure — the truth was only in the dead worker's log. After a short
+    wait: a nonzero exit sentinel, or a dead session whose log shows a
+    bundle/module load failure, is reported loudly. Kept honest: a FAST
+    SUCCESSFUL worker (sentinel 0) is fine — say nothing; a dead session
+    with no sentinel and no known failure pattern is left to the
+    supervisor's worker_failed path (never guess).
+    """
+    time.sleep(DISPATCH_EARLY_DEATH_WAIT_S)
+    obs = workers.observe(session, log_path)
+    # The launch wrapper tails `sleep 3` after the worker command exits, so a
+    # failed worker's tmux session can still be "alive" here — the sentinel,
+    # not liveness, is the primary signal.
+    if obs.sentinel_seen:
+        if obs.exit_code == 0:
+            return None  # fast success — nothing to warn about
+        return (
+            f"worker {session} died {DISPATCH_EARLY_DEATH_WAIT_S:.0f}s after dispatch "
+            f"(exit {obs.exit_code}) — it likely never did any work. See its log: {log_path}"
+        )
+    if not obs.alive:
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        if workers.LOAD_FAILURE_RE.search(workers.strip_ansi(text)):
+            return f"worker {session} died immediately with a bundle/module load failure — see its log: {log_path}"
+    return None
+
+
 def _cmd_dispatch(args: argparse.Namespace, as_json: bool) -> int:
     # dispatch never writes state.json (the supervise loop owns it); it writes
     # workers/<session>/meta.json + append-only event/ledger lines, and the
@@ -136,10 +192,16 @@ def _cmd_dispatch(args: argparse.Namespace, as_json: bool) -> int:
     state.ledger_append(
         "dispatched", session=meta["session"], name=args.name, cmd=cmd, task=args.task, judge_cmd=args.judge
     )
+    log_path = state.worker_log_path(meta["session"])
+    warning = _early_death_warning(meta["session"], log_path)
+    if warning is not None:
+        state.append_event("worker:dispatch_failed", session=meta["session"], name=args.name, error=warning)
+        print(f"ERROR: dispatched {meta['session']}, but {warning}", file=sys.stderr)
+        return 1
     if as_json:
-        print(json.dumps({**meta, "log": str(state.worker_log_path(meta["session"]))}, indent=2))
+        print(json.dumps({**meta, "log": str(log_path)}, indent=2))
     else:
-        print(f"dispatched {meta['session']} (log: {state.worker_log_path(meta['session'])})")
+        print(f"dispatched {meta['session']} (log: {log_path})")
     return 0
 
 
@@ -182,7 +244,17 @@ def _cmd_triage(args: argparse.Namespace, as_json: bool) -> int:
         print(json.dumps([o.to_dict() for o in outcomes], indent=2))
         return 0
     if not outcomes:
-        print("triage pass: nothing to do (no untriaged pending packets, no unproposed answered packets)")
+        # The no-work message states WHAT WAS SCANNED so it can never
+        # contradict visible disk state (defect: "nothing to do ... no
+        # unproposed answered packets" while human-answered packets sat in
+        # answered/ awaiting their rule_delta).
+        stats = runner.scan_stats()
+        print(
+            "triage pass: nothing to do — scanned "
+            f"{stats['pending_total']} pending ({stats['pending_untriaged']} untriaged), "
+            f"{stats['answered_total']} answered ({stats['answered_awaiting_rule_delta']} awaiting rule_delta), "
+            f"{stats['abandoned_skipped']} abandoned skipped"
+        )
         return 0
     for o in outcomes:
         print(f"{o.packet_id}  {o.phase:<10} {o.outcome:<12} {_truncate(o.detail, 80)}")
@@ -420,6 +492,14 @@ def _cmd_judge_verify(args: argparse.Namespace, as_json: bool) -> int:
 
 # -- ledger summary (the "what landed today" closure ritual) -----------------------
 
+# The north-star metric's unit definitions (design §Metrics). One WORK UNIT =
+# one dispatched worker or one workunit-run pipeline: exactly one `dispatched`
+# or `workunit_finished` ledger entry. FAILED units are counted from
+# `loop_failed` + `worker_failed` entries and EXCLUDED from the healthy
+# denominator — a failed unit must never improve the metric.
+WORK_UNIT_KINDS = ("dispatched", "workunit_finished")
+FAILED_UNIT_KINDS = ("loop_failed", "worker_failed")
+
 
 def summarize_ledger(entries: list[dict]) -> dict:
     """Reduce one day's ledger entries to the closure-ritual summary dict."""
@@ -427,8 +507,13 @@ def summarize_ledger(entries: list[dict]) -> dict:
 
     loops_closed = [e for e in entries if e.get("kind") == "loop_closed"]
     loops_failed = [e for e in entries if e.get("kind") == "loop_failed"]
+    worker_failed = [e for e in entries if e.get("kind") == "worker_failed"]
+    failed_sessions = {e.get("session") for e in worker_failed}
     finished = [e for e in entries if e.get("kind") == "worker_finished"]
-    unjudged = [e for e in finished if not e.get("judged")]
+    # Failure and success are separate buckets — an unjudged death must not
+    # sit next to a clean exit-0 finish as if they were the same outcome.
+    # (Old ledgers without worker_failed entries keep everything in unjudged.)
+    unjudged = [e for e in finished if not e.get("judged") and e.get("session") not in failed_sessions]
     created = [e for e in entries if e.get("kind") == "packet_created"]
     answered = [e for e in entries if e.get("kind") == "packet_answered"]
     latencies = [e["latency_s"] for e in answered if e.get("latency_s") is not None]
@@ -442,6 +527,10 @@ def summarize_ledger(entries: list[dict]) -> dict:
         "loops_failed": [
             {"session": e.get("session"), "name": e.get("name"), "reason": e.get("reason")} for e in loops_failed
         ],
+        "workers_failed": [
+            {"session": e.get("session"), "exit_code": e.get("exit_code"), "reason": e.get("reason")}
+            for e in worker_failed
+        ],
         "workers_finished_unjudged": [{"session": e.get("session"), "exit_code": e.get("exit_code")} for e in unjudged],
         "packets_created": len(created),
         "packets_answered": len(answered),
@@ -452,6 +541,74 @@ def summarize_ledger(entries: list[dict]) -> dict:
         ],
         "notification_batches": len(batches),
     }
+
+
+# -- the north-star instrument: escalations per work unit, week over week -----------
+
+
+def _iso_week(day: date) -> tuple[int, int]:
+    iso = day.isocalendar()
+    return (iso[0], iso[1])
+
+
+def _week_bucket(entries: list[dict]) -> dict:
+    """Reduce one ISO week's ledger entries to the metric's ingredients."""
+    units = sum(1 for e in entries if e.get("kind") in WORK_UNIT_KINDS)
+    failed = sum(1 for e in entries if e.get("kind") in FAILED_UNIT_KINDS)
+    escalations = sum(1 for e in entries if e.get("kind") == "packet_created")
+    healthy = max(units - failed, 0)
+    return {
+        "escalations": escalations,
+        "units": units,
+        "failed": failed,
+        "healthy": healthy,
+        # METRIC INTEGRITY: escalations ÷ HEALTHY units only. Counting failed
+        # units in the denominator would let failures IMPROVE the metric.
+        "per_healthy_unit": round(escalations / healthy, 2) if healthy else None,
+    }
+
+
+def week_metric(state: SupervisorState, reference: date | None = None) -> dict:
+    """Escalations-per-work-unit for the reference ISO week vs the week before.
+
+    Computed from ledger/*.jsonl (file stem = YYYY-MM-DD). This is the design
+    §Metrics north star: the number must FALL week over week.
+    """
+    reference = reference or datetime.now(UTC).date()
+    this_week = _iso_week(reference)
+    # Monday of the reference week minus one day lands in the previous ISO week.
+    monday = date.fromisocalendar(this_week[0], this_week[1], 1)
+    last_week = _iso_week(date.fromordinal(monday.toordinal() - 1))
+
+    by_week: dict[tuple[int, int], list[dict]] = {this_week: [], last_week: []}
+    if state.ledger_dir.exists():
+        for path in sorted(state.ledger_dir.glob("*.jsonl")):
+            try:
+                day = date.fromisoformat(path.stem)
+            except ValueError:
+                continue  # not a daily ledger file
+            week = _iso_week(day)
+            if week in by_week:
+                by_week[week].extend(state.ledger_read(path.stem))
+    return {
+        "this_week": _week_bucket(by_week[this_week]),
+        "last_week": _week_bucket(by_week[last_week]),
+    }
+
+
+def format_week_metric(metric: dict) -> str:
+    """One line: the north-star number, this week vs last, failures excluded."""
+
+    def _rate(bucket: dict) -> str:
+        if bucket["per_healthy_unit"] is None:
+            return "n/a"
+        return f"{bucket['per_healthy_unit']:.2f}"
+
+    this, last = metric["this_week"], metric["last_week"]
+    return (
+        f"escalations/work-unit (healthy): {_rate(this)} "
+        f"({this['units']} units, {this['failed']} failed excluded) | last week: {_rate(last)}"
+    )
 
 
 def format_ledger_summary(summary: dict, date: str, path: str) -> str:
@@ -470,6 +627,13 @@ def format_ledger_summary(summary: dict, date: str, path: str) -> str:
     for e in failed:
         lines.append(f"  {e['session']}  — {_truncate(e.get('reason') or '?', 70)}")
     if not failed:
+        lines.append("  (none)")
+
+    workers_failed = summary["workers_failed"]
+    lines.append(f"Workers failed unjudged ({len(workers_failed)}):")
+    for e in workers_failed:
+        lines.append(f"  {e['session']}  — {_truncate(e.get('reason') or '?', 70)}")
+    if not workers_failed:
         lines.append("  (none)")
 
     unjudged = summary["workers_finished_unjudged"]
@@ -500,11 +664,17 @@ def _cmd_ledger(args: argparse.Namespace, as_json: bool) -> int:
     entries = state.ledger_read(args.date)
     if args.summary:
         summary = summarize_ledger(entries)
+        day = args.date or datetime.now(UTC).strftime("%Y-%m-%d")
+        try:
+            reference = date.fromisoformat(day)
+        except ValueError as e:
+            raise ValueError(f"--date {day!r} is not a valid YYYY-MM-DD date") from e
+        metric = week_metric(state, reference)
         if as_json:
-            print(json.dumps(summary, indent=2))
+            print(json.dumps({**summary, "week_metric": metric}, indent=2))
             return 0
-        date = args.date or datetime.now(UTC).strftime("%Y-%m-%d")
-        print(format_ledger_summary(summary, date, str(state.ledger_path(args.date))))
+        print(format_ledger_summary(summary, day, str(state.ledger_path(args.date))))
+        print(format_week_metric(metric))
         return 0
     if as_json:
         print(json.dumps(entries, indent=2))
@@ -530,7 +700,13 @@ def build_parser() -> argparse.ArgumentParser:
     show_p.add_argument("packet_id")
     queue_sub.add_parser("path", help="print the queue root path")
 
-    answer_p = sub.add_parser("answer", help="answer a pending packet")
+    answer_p = sub.add_parser(
+        "answer",
+        help=(
+            "answer a pending OR bounced packet (option = one of the packet's option ids; see 'queue show <id>'). "
+            "Answering a bounced packet is the human override on a triage bounce."
+        ),
+    )
     answer_p.add_argument("packet_id")
     answer_p.add_argument("option")
     answer_p.add_argument("--rationale", default=None)

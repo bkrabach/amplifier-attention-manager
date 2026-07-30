@@ -76,6 +76,15 @@ class PacketQueue:
         packets = [self._load(p) for p in sorted(self.dir("pending").glob("pkt-*.json"))]
         return sorted(packets, key=lambda p: p.id)
 
+    def list_bounced(self) -> list[Packet]:
+        """All bounced packets, sorted by id.
+
+        Bounced packets are visible (queue list marks them BOUNCED) so a human
+        never has to know to look in bounced/ — and reclaimable via answer().
+        """
+        packets = [self._load(p) for p in sorted(self.dir("bounced").glob("pkt-*.json"))]
+        return sorted(packets, key=lambda p: p.id)
+
     def locate(self, packet_id: str) -> tuple[str, Path]:
         """Find a packet by id across all subdirs. Raises KeyError if absent."""
         for subdir in SUBDIRS:
@@ -98,14 +107,20 @@ class PacketQueue:
         rationale: str | None = None,
         answered_by: str = "human",
     ) -> Packet:
-        """Answer a pending packet: fill resolution and move it to answered/.
+        """Answer a pending OR bounced packet: fill resolution, move to answered/.
 
-        Raises ValueError if the packet is not pending or the option is not one
-        of the packet's declared options (fail loud — never invent an answer).
+        Answering a bounced packet is the HUMAN OVERRIDE on a triage bounce:
+        triage removing a genuine decision from pending/ must never leave the
+        human without recourse (recovery used to depend on the worker
+        re-arguing its own packet). One command reclaims the decision.
+
+        Raises ValueError if the packet is already answered or the option is
+        not one of the packet's declared options (fail loud — never invent an
+        answer).
         """
         subdir, path = self.locate(packet_id)
-        if subdir != "pending":
-            raise ValueError(f"packet {packet_id!r} is in {subdir}/, not pending/ — cannot answer")
+        if subdir not in ("pending", "bounced"):
+            raise ValueError(f"packet {packet_id!r} is in {subdir}/, not pending/ or bounced/ — cannot answer")
 
         packet = self._load(path)
         ids = packet.option_ids()

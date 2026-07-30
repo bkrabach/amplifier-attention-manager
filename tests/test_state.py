@@ -118,14 +118,22 @@ class TestAdoptWorkers:
         meta = {"name": session.removeprefix("am-"), "session": session, "cmd": "true", "task": "t", **extra}
         (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
-    def test_adopt_from_dirs_and_tmux(self, home):
+    def test_adopt_from_dirs_and_tmux_is_home_scoped(self, home):
+        """D10: only sessions dispatched by THIS home (workers/<session>/ dir
+        under it) are adopted. am-* sessions from other homes on the same tmux
+        server are ignored — not even warned (defect: one persona's workers
+        appeared in another persona's status and daily ledger)."""
         self._write_meta(home, "am-disk")
+        (home / "workers" / "am-live").mkdir(parents=True)  # ours, dir but no meta yet
         state = SupervisorState(home)
-        added = state.adopt_workers(["am-live", "other-session"])
+        added = state.adopt_workers(["am-live", "am-foreign", "other-session"])
         assert sorted(added) == ["am-disk", "am-live"]
         assert state.workers["am-disk"]["cmd"] == "true"
         assert state.workers["am-live"]["adopted_without_meta"] is True
+        assert "am-foreign" not in state.workers  # another home's worker — ignored
         assert "other-session" not in state.workers  # non-am-* ignored
+        # And no warning event either: another home's sessions are not our business.
+        assert [e for e in state.read_events() if e["event"] == "state:error"] == []
 
     def test_adopt_is_idempotent_and_preserves_flags(self, home):
         self._write_meta(home, "am-disk")

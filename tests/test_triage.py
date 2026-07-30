@@ -313,11 +313,36 @@ class TestRuleDeltaPhase:
         assert len(events_named(home, "rule_delta:none")) == 1
         assert runner.triage_pass() == []  # never re-proposed
 
-    def test_answered_packet_without_triage_is_skipped(self, runner, monkeypatch):
+    def test_answer_before_triage_still_produces_proposal(self, runner, home, monkeypatch):
+        """EVERY human answer compounds, unconditionally (dogfood defect: packets
+        answered before a successful triage pass silently never produced a
+        proposal — the product's headline loop voided itself)."""
         monkeypatch.setenv("FAKE_DELTA_MODE", "propose")
         packet = make_packet()
         runner.queue.write(packet)
         runner.queue.answer(packet.id, "B", answered_by="human")  # answered BEFORE any triage
+        outcomes = runner.triage_pass()
+        assert [(o.phase, o.outcome) for o in outcomes] == [("rule_delta", "proposed")]
+        proposals = runner.rulebook.list_proposals()
+        assert len(proposals) == 1 and proposals[0]["packet_id"] == packet.id
+        # No triage recommendation existed -> no calibration signal, no trust move.
+        ledger = SupervisorState(home).ledger_read()
+        entry = next(e for e in ledger if e["kind"] == "rule_delta_proposed")
+        assert entry["recommendation_matched"] is None
+        # Idempotent: never re-proposed.
+        assert runner.triage_pass() == []
+        assert len(runner.rulebook.list_proposals()) == 1
+
+    def test_auto_and_timeout_answers_are_skipped(self, runner, monkeypatch):
+        """Only HUMAN answers imply rule changes: auto answers calibrate via
+        `auto confirm/reject`; timeout-defaults express no human preference."""
+        monkeypatch.setenv("FAKE_DELTA_MODE", "propose")
+        auto_pkt = make_packet()
+        runner.queue.write(auto_pkt)
+        runner.queue.answer(auto_pkt.id, "B", answered_by="manager-auto")
+        timeout_pkt = make_packet()
+        runner.queue.write(timeout_pkt)
+        runner.queue.answer(timeout_pkt.id, "B", answered_by="timeout-default")
         assert runner.triage_pass() == []
         assert runner.rulebook.list_proposals() == []
 
@@ -377,6 +402,29 @@ class TestCliTriage:
         assert main(["triage", "--once"]) == 0
         out = capsys.readouterr().out
         assert "recommended" in out
+
+    def test_no_work_message_states_what_was_scanned(self, home, queue_root, fake_amplifier, monkeypatch, capsys):
+        """The old message ("nothing to do ... no unproposed answered packets")
+        contradicted visible disk state. The new one reports the scan counts."""
+        from attention_manager.cli import main
+
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "recommend")
+        monkeypatch.setenv("FAKE_DELTA_MODE", "propose")
+        monkeypatch.setenv("ATTENTION_AMPLIFIER_BIN", str(fake_amplifier))
+        monkeypatch.setenv("ATTENTION_TRIAGE_BUNDLE", "test://triage-bundle")
+        queue = PacketQueue(queue_root)
+        packet = make_packet()
+        queue.write(packet)
+        queue.answer(packet.id, "B", answered_by="human")
+
+        assert main(["triage", "--once"]) == 0  # proposes for the answered packet
+        capsys.readouterr()
+        assert main(["triage", "--once"]) == 0  # now genuinely nothing to do
+        out = capsys.readouterr().out
+        assert "nothing to do — scanned" in out
+        assert "0 pending (0 untriaged)" in out
+        assert "1 answered (0 awaiting rule_delta)" in out
+        assert "0 abandoned skipped" in out
 
     def test_triage_requires_once_flag(self, capsys):
         from attention_manager.cli import main

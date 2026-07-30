@@ -69,6 +69,33 @@ class TestMount:
         await on_session_ready(coordinator)  # must not raise
 
 
+class TestProvenanceLinks:
+    """links.resume + source.session_id are REAL when the coordinator's session
+    id is cheaply available; absent otherwise (producer-dependent by contract)."""
+
+    def test_build_packet_fills_resume_link_with_session_id(self):
+        coordinator = MagicMock()
+        coordinator.session_id = "sess-77"
+        provider = PacketApprovalProvider({}, coordinator=coordinator)
+        packet = provider.build_packet(make_request())
+        assert packet["source"]["session_id"] == "sess-77"
+        assert packet["links"]["resume"] == "amplifier session resume sess-77"
+
+    def test_build_packet_leaves_links_empty_without_session_id(self):
+        provider = PacketApprovalProvider({})  # no coordinator
+        packet = provider.build_packet(make_request())
+        assert "session_id" not in packet["source"]
+        assert packet["links"] == {}
+
+    async def test_mount_passes_coordinator_to_provider(self):
+        coordinator = MagicMock()
+        coordinator.session_id = "sess-88"
+        await mount(coordinator, {})
+        _, provider = coordinator.register_capability.call_args[0]
+        packet = provider.build_packet(make_request())
+        assert packet["links"]["resume"] == "amplifier session resume sess-88"
+
+
 class TestGatePolicy:
     """gate_tools config → tool:pre policy hook that survives policy_driven_only.
 

@@ -7,14 +7,18 @@
 # header (PHASE / PACKET_ID / OUTPUT_PATH) and writes canned verdict files,
 # exercising the FULL disk-based verdict protocol end to end:
 #
-# Happy path: seed rulebook + 3 packets (decidable / cold-undecidable /
-# invalid-verdict). One `triage --once` pass must: fill triage fields +
-# recommendation on the decidable packet (atomically, still pending), move
-# the undecidable one to bounced/ with a reason, and handle the
-# invalid-verdict one loudly (2 triage:error events — one retry max — packet
-# untouched, NO fabricated verdict). Then: answer the good packet, second
-# pass proposes EXACTLY ONE rule_delta (idempotent on a third pass), and
-# `rulebook apply` lands the sentence in the correct section.
+# Happy path: seed rulebook + 4 packets (decidable / cold-undecidable /
+# invalid-verdict / PRE-ANSWERED — human-answered before any triage pass).
+# One `triage --once` pass must: fill triage fields + recommendation on the
+# decidable packet (atomically, still pending), move the undecidable one to
+# bounced/ with a reason, handle the invalid-verdict one loudly (2
+# triage:error events — one retry max — packet untouched, NO fabricated
+# verdict), AND propose a rule_delta for the pre-answered packet (every
+# human answer compounds, unconditionally — triaged or not; the dogfood
+# defect was exactly this packet class silently never proposing). Then:
+# answer the good packet, second pass proposes its rule_delta too
+# (idempotent on a third pass), and `rulebook apply` lands the sentence in
+# the correct section.
 #
 # Exit 0 + "PASS: <reason>" or exit 1 + "FAIL: <reason>".
 #
@@ -70,8 +74,9 @@ PY
 }
 
 seed_packets() {
-    # Seeds 3 packets via the ROOT queue lib; prints the three ids in order:
-    # good / undecidable / invalid-verdict.
+    # Seeds 4 packets via the ROOT queue lib; prints the four ids in order:
+    # good / undecidable / invalid-verdict / pre-answered (human-answered
+    # BEFORE any triage pass — must still produce a rule_delta proposal).
     python3 - <<'PY'
 from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
@@ -95,11 +100,19 @@ invalid = Packet(
     source=Source(kind="decision"),
     context="Used to prove the runner never accepts a malformed verdict.",
 )
-for p in (good, undecidable, invalid):
+pre_answered = Packet(
+    question="smoke: answered before triage ever saw it — must still compound",
+    options=[Option(id="A", label="Yes"), Option(id="B", label="No")],
+    source=Source(kind="decision"),
+    context="Human answered this before any triage pass ran.",
+)
+for p in (good, undecidable, invalid, pre_answered):
     q.write(p)
+q.answer(pre_answered.id, "A", rationale="answered pre-triage", answered_by="human")
 print(good.id)
 print(undecidable.id)
 print(invalid.id)
+print(pre_answered.id)
 PY
 }
 
@@ -133,12 +146,13 @@ run_smoke() {
     fi
     echo "  rulebook created from template (design sections present)"
 
-    local ids good_id undecidable_id invalid_id
+    local ids good_id undecidable_id invalid_id pre_answered_id
     ids="$(seed_packets)" || { echo "FAIL: could not seed packets"; return 1; }
     good_id="$(echo "$ids" | sed -n 1p)"
     undecidable_id="$(echo "$ids" | sed -n 2p)"
     invalid_id="$(echo "$ids" | sed -n 3p)"
-    echo "  seeded packets: good=$good_id undecidable=$undecidable_id invalid=$invalid_id"
+    pre_answered_id="$(echo "$ids" | sed -n 4p)"
+    echo "  seeded packets: good=$good_id undecidable=$undecidable_id invalid=$invalid_id pre-answered=$pre_answered_id"
 
     if [ "$mode" = "triage" ]; then
         if ! am triage --once >"$ATTENTION_HOME/triage-pass-1.out" 2>&1; then
@@ -207,6 +221,21 @@ PY
     fi
     echo "  invalid verdict: 2 loud triage:error events (retry once), packet untouched"
 
+    # -- pre-answered packet: proposal from PASS 1 (answered before triage) ----
+    if ! python3 - "$pre_answered_id" <<'PY'
+import os, sys
+from attention_manager.rulebook import Rulebook
+records = [r for r in Rulebook(home=os.environ["ATTENTION_HOME"]).list_proposals()
+           if r.get("packet_id") == sys.argv[1]]
+assert len(records) == 1, f"pre-answered packet has {len(records)} proposal records, expected 1"
+assert records[0]["status"] in ("proposed", "none"), records[0]
+PY
+    then
+        echo "FAIL: packet answered BEFORE triage produced no rule_delta proposal (every answer must compound)"
+        return 1
+    fi
+    echo "  pre-answered packet: rule_delta proposal produced on the FIRST pass (unconditional compounding)"
+
     # -- ledger tells the triage story ----------------------------------------
     if ! python3 - <<'PY'
 import json, os, sys
@@ -227,7 +256,7 @@ PY
     fi
     echo "  ledger records triage_recommended + triage_bounced"
 
-    # -- answer the good packet, second pass -> EXACTLY ONE rule_delta --------
+    # -- answer the good packet, second pass -> its rule_delta (2 total) ------
     if ! am answer "$good_id" A --rationale "smoke: agree with triage" >/dev/null; then
         echo "FAIL: could not answer the good packet"
         return 1
@@ -237,26 +266,28 @@ PY
         return 1
     fi
     local proposal_id
-    proposal_id="$(am --json rulebook proposals | python3 -c '
+    proposal_id="$(am --json rulebook proposals | python3 -c "
 import json, sys
-proposals = [p for p in json.load(sys.stdin) if p.get("status") == "proposed"]
-assert len(proposals) == 1, f"expected exactly 1 proposal, got {len(proposals)}"
-assert proposals[0]["section"] == "Auto-answer rules", proposals[0]
-print(proposals[0]["id"])
-')" || { echo "FAIL: expected exactly ONE rule_delta proposal after the answer"; return 1; }
-    if [ "$(count_events "rule_delta:proposed")" -ne 1 ]; then
-        echo "FAIL: expected 1 rule_delta:proposed event, got $(count_events rule_delta:proposed)"
+proposals = [p for p in json.load(sys.stdin) if p.get('status') == 'proposed']
+assert len(proposals) == 2, f'expected exactly 2 proposals (pre-answered + good), got {len(proposals)}'
+good = [p for p in proposals if p['packet_id'] == '$good_id']
+assert len(good) == 1, f'no proposal for the good packet: {proposals}'
+assert good[0]['section'] == 'Auto-answer rules', good[0]
+print(good[0]['id'])
+")" || { echo "FAIL: expected exactly TWO rule_delta proposals after the answer (pre-answered + good)"; return 1; }
+    if [ "$(count_events "rule_delta:proposed")" -ne 2 ]; then
+        echo "FAIL: expected 2 rule_delta:proposed events, got $(count_events rule_delta:proposed)"
         return 1
     fi
-    echo "  second pass: exactly ONE rule_delta proposal ($proposal_id)"
+    echo "  second pass: good packet's rule_delta proposed ($proposal_id); 2 proposals total"
 
     # -- idempotency: third pass must not re-propose --------------------------
     am triage --once >/dev/null 2>&1
-    if [ "$(am --json rulebook proposals | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" -ne 1 ]; then
+    if [ "$(am --json rulebook proposals | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" -ne 2 ]; then
         echo "FAIL: third pass double-proposed for the same packet (idempotency broken)"
         return 1
     fi
-    echo "  third pass: still exactly one proposal (idempotent)"
+    echo "  third pass: still exactly two proposals (idempotent)"
 
     # -- apply lands the sentence in the RIGHT section -------------------------
     if ! am rulebook apply "$proposal_id" >/dev/null; then

@@ -26,11 +26,18 @@ Two phases per pass:
   only if the producer supplied none — a producer recommendation is kept, the
   triage one lives in ``triage.why``); ``bounce`` moves the packet to
   ``bounced/`` with the reason merged into ``triage.why``.
-- **rule_delta** — every ANSWERED packet that went through triage and has no
-  proposal record yet gets ONE proposed rule sentence (or an explicit,
-  logged "none — genuinely one-off"). Proposals are recorded in the rulebook
-  proposals file; a human applies/rejects them (Phase 1: nothing is applied
-  automatically). Idempotent across passes via the proposals packet-id set.
+- **rule_delta** — every HUMAN-ANSWERED packet (``resolution.answered_by ==
+  "human"``) with no proposal record yet gets ONE proposed rule sentence (or
+  an explicit, logged "none — genuinely one-off"). UNCONDITIONAL on triage:
+  a packet answered before any successful triage pass still compounds — the
+  design's post-answer step ALWAYS asks "what rule change does this answer
+  imply?"; triage fields are optional enrichment (they only add the
+  recommendation-match calibration signal). Auto-answered packets are
+  skipped (they calibrate via ``auto confirm``/``auto reject``), as are
+  timeout-default answers (no human preference was expressed). Proposals are
+  recorded in the rulebook proposals file; a human applies/rejects them
+  (Phase 1: nothing is applied automatically). Idempotent across passes via
+  the proposals packet-id set.
 
 Graduated trust (design §Triage, Phase 2 — build step 6):
 
@@ -784,34 +791,76 @@ class TriageRunner:
                 print(f"ERROR: skipping malformed packet file {path}: {e}", file=self._err)
         return sorted(packets, key=lambda p: p.id)
 
+    def _triage_candidates(self) -> tuple[list[Packet], int]:
+        """(untriaged pending packets a pass would process, abandoned-skip count)."""
+        candidates: list[Packet] = []
+        abandoned = 0
+        for packet in self._scan("pending"):
+            if packet.triage is not None:
+                continue  # already triaged
+            if self._is_abandoned(packet.id, "triage"):
+                # abandoned loudly once — human answers via queue; 'triage --retry' re-enables
+                abandoned += 1
+                continue
+            candidates.append(packet)
+        return candidates, abandoned
+
+    def _rule_delta_candidates(self) -> tuple[list[Packet], int]:
+        """(human-answered packets awaiting a rule_delta, abandoned-skip count).
+
+        UNCONDITIONAL on triage (design §Rulebook Contract: the post-answer
+        step ALWAYS asks what rule change the answer implies): a packet
+        answered before any successful triage pass still compounds. Triage
+        fields, when present, only enrich calibration (recommendation match).
+        Auto answers calibrate via `auto confirm`/`auto reject` instead, and
+        timeout-default answers carry no human preference — both skipped.
+        """
+        proposed_ids = self.rulebook.proposal_packet_ids()
+        candidates: list[Packet] = []
+        abandoned = 0
+        for packet in self._scan("answered"):
+            if packet.resolution is None or packet.resolution.answered_by != "human":
+                continue  # only HUMAN answers imply rule changes
+            if packet.id in proposed_ids:
+                continue  # already has a proposal record (incl. explicit 'none')
+            if self._is_abandoned(packet.id, "rule_delta"):
+                abandoned += 1  # abandoned loudly once — 'triage --retry' re-enables
+                continue
+            candidates.append(packet)
+        return candidates, abandoned
+
+    def scan_stats(self) -> dict[str, int]:
+        """Honest no-work accounting: what a pass would consider RIGHT NOW.
+
+        Used by the CLI so a "nothing to do" report states what was scanned —
+        it can never again contradict visible disk state (a human-answered
+        packet sitting in answered/ while the CLI claims nothing awaits).
+        """
+        triage_candidates, triage_abandoned = self._triage_candidates()
+        delta_candidates, delta_abandoned = self._rule_delta_candidates()
+        return {
+            "pending_total": len(self._scan("pending")),
+            "pending_untriaged": len(triage_candidates),
+            "answered_total": len(self._scan("answered")),
+            "answered_awaiting_rule_delta": len(delta_candidates),
+            "abandoned_skipped": triage_abandoned + delta_abandoned,
+        }
+
     def triage_pass(self) -> list[Outcome]:
         """One full pass: recommend/bounce all untriaged pending packets, then
-        propose rule deltas for answered+triaged packets without one. Idempotent
+        propose rule deltas for EVERY human-answered packet without one
+        (triaged or not — every answer compounds, unconditionally). Idempotent
         across runs — triage fields and the proposals packet-id set are the
         guards; nothing is ever double-processed."""
         rulebook_content, _ = self.rulebook.read()
         outcomes: list[Outcome] = []
 
-        for packet in self._scan("pending"):
-            if packet.triage is not None:
-                continue  # already triaged
-            if self._is_abandoned(packet.id, "triage"):
-                continue  # abandoned loudly once — human answers via queue; 'triage --retry' re-enables
+        triage_candidates, _ = self._triage_candidates()
+        for packet in triage_candidates:
             outcomes.append(self._triage_one(packet, rulebook_content))
 
-        proposed_ids = self.rulebook.proposal_packet_ids()
-        for packet in self._scan("answered"):
-            if packet.triage is None:
-                continue  # never triaged — rule_delta needs the triage why for calibration
-            if packet.resolution is not None and packet.resolution.answered_by == AUTO_ANSWERED_BY:
-                # Auto-answered: the rule that answered it already exists, so a
-                # rule_delta proposal is meaningless; calibration happens via
-                # the `auto confirm` / `auto reject` CLI instead.
-                continue
-            if packet.id in proposed_ids:
-                continue  # already has a proposal record (incl. explicit 'none')
-            if self._is_abandoned(packet.id, "rule_delta"):
-                continue  # abandoned loudly once — 'triage --retry' re-enables
+        delta_candidates, _ = self._rule_delta_candidates()
+        for packet in delta_candidates:
             outcomes.append(self._rule_delta_one(packet, rulebook_content))
 
         return outcomes
