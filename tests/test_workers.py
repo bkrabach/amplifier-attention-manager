@@ -50,6 +50,33 @@ class TestPureLogic:
     def test_extract_session_id_absent(self):
         assert workers.extract_session_id("no id") is None
 
+    # Regression: DTU eval S4 — the REAL amplifier CLI styles the line, so
+    # pipe-pane captures ANSI codes BETWEEN "Session ID: " and the uuid
+    # (verbatim bytes from the eval artifact, worker-am-w1.log line 9).
+    REAL_ANSI_LINE = "\x1b[2mSession ID: \x1b[0m\x1b[2;93mcb818d5e-5cfa-42ac-87b0-8a14abe053b9\x1b[0m"
+
+    def test_extract_session_id_real_ansi_styled_line(self):
+        text = f"starting...\n{self.REAL_ANSI_LINE}\nrunning"
+        assert workers.extract_session_id(text) == "cb818d5e-5cfa-42ac-87b0-8a14abe053b9"
+
+    def test_observe_extracts_session_id_from_ansi_log(self, tmp_path, monkeypatch):
+        """Through the REAL observe() extraction path (only liveness stubbed)."""
+        monkeypatch.setattr(workers, "session_alive", lambda session: True)
+        log = tmp_path / "worker.log"
+        log.write_bytes(f"boot\r\n{self.REAL_ANSI_LINE}\r\nworking\r\n".encode())
+        obs = workers.observe("am-ansi", log)
+        assert obs.session_id == "cb818d5e-5cfa-42ac-87b0-8a14abe053b9"
+
+    def test_sentinel_parses_amid_ansi_output_without_stripping(self):
+        """Documented decision: parse_exit_sentinel does NOT strip ANSI — the
+        sentinel is our own plain bash echo (contiguous bytes) plus a raw
+        direct-append copy. Escape codes AROUND it must not matter."""
+        text = "\x1b[2;93mstyled tail\x1b[0m\r\n__AM_WORKER_EXIT:0__\r\n"
+        assert workers.parse_exit_sentinel(text) == 0
+
+    def test_strip_ansi_removes_csi_and_osc(self):
+        assert workers.strip_ansi("\x1b[2mdim\x1b[0m \x1b]0;title\x07plain") == "dim plain"
+
     def test_default_worker_cmd_with_bundle(self):
         cmd = workers.default_worker_cmd("do the thing", "git+https://example/bundle@main")
         assert cmd == "amplifier run -B git+https://example/bundle@main 'do the thing'"

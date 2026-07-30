@@ -53,6 +53,9 @@ write_fake_worker() {
     # (observe() extracts it from worker.log — the bell-join key), write a
     # decision packet carrying the SAME id as source.session_id (root queue
     # lib), poll for resolution, exit 0 iff answered with the expected option.
+    # style=ansi reproduces the REAL amplifier CLI byte pattern (ANSI codes
+    # between the label and the uuid — DTU eval S4 regression): a plain-text
+    # "Session ID:" line is a too-clean proxy that hid the extraction bug.
     cat >"$1" <<'PY'
 import sys
 import uuid
@@ -60,9 +63,12 @@ import uuid
 from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
 
-name, expected, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])
+name, expected, timeout_s, style = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
 sid = str(uuid.uuid4())
-print(f"Session ID: {sid}", flush=True)  # captured by pipe-pane -> worker.log -> observe()
+if style == "ansi":  # verbatim real-CLI styling: dim label, dim-off + color-on, uuid, reset
+    print(f"\x1b[2mSession ID: \x1b[0m\x1b[2;93m{sid}\x1b[0m", flush=True)
+else:
+    print(f"Session ID: {sid}", flush=True)  # captured by pipe-pane -> worker.log -> observe()
 q = PacketQueue()
 p = Packet(
     question=f"smoke [{name}]: proceed with option {expected}?",
@@ -125,10 +131,15 @@ run_smoke() {
     local envprefix="ATTENTION_QUEUE_DIR=$ATTENTION_QUEUE_DIR PYTHONPATH=$PYTHONPATH"
 
     # Dispatch BOTH workers first (both packets exist before the supervisor's
-    # first tick → the one-batch assertion is deterministic).
+    # first tick → the one-batch assertion is deterministic). Worker 1 emits a
+    # plain "Session ID:" line; worker 2 emits the REAL ANSI-styled byte
+    # pattern (DTU eval S4 regression) — both must join and ring.
+    local style
     for n in "$n1" "$n2"; do
+        style="plain"
+        [ "$n" = "$n2" ] && style="ansi"
         if ! am dispatch "$n" --task "smoke worker $n" \
-            --worker-cmd "$envprefix python3 $worker_py $n A 90"; then
+            --worker-cmd "$envprefix python3 $worker_py $n A 90 $style"; then
             echo "FAIL: dispatch $n failed"
             return 1
         fi

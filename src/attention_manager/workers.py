@@ -44,6 +44,13 @@ EXIT_SENTINEL_TEMPLATE = "__AM_WORKER_EXIT:{code}__"
 EXIT_SENTINEL_RE = re.compile(r"__AM_WORKER_EXIT:(\d+)__")
 # Best-effort: amplifier CLI prints "Session ID: <uuid>" near startup.
 SESSION_ID_RE = re.compile(r"Session ID:\s*([0-9a-fA-F][0-9a-fA-F-]{7,})")
+# CSI + OSC escape sequences (same shape as evals/run_evals.py _strip_ansi).
+# The REAL amplifier CLI styles its output: pipe-pane captures e.g.
+#   \x1b[2mSession ID: \x1b[0m\x1b[2;93m<uuid>\x1b[0m
+# — escape codes BETWEEN the label and the uuid, which \s* cannot cross.
+# Found by DTU eval S4: session ids never extracted for real workers, so the
+# packet↔worker bell join never bound and no bell rang (silently).
+ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
 
 
 def require_tmux() -> str:
@@ -78,6 +85,7 @@ def list_am_sessions() -> list[str]:
         [tmux, "list-sessions", "-F", "#{session_name}"],
         capture_output=True,
         text=True,
+        check=False,  # nonzero = "no server running" (normal empty state, handled below)
     )
     if proc.returncode != 0:
         # "no server running" is a normal empty state, not an error.
@@ -88,14 +96,14 @@ def list_am_sessions() -> list[str]:
 def session_alive(session: str) -> bool:
     """True if the exact tmux session exists (``=`` prefix forces exact match)."""
     tmux = require_tmux()
-    proc = subprocess.run([tmux, "has-session", "-t", f"={session}"], capture_output=True)
+    proc = subprocess.run([tmux, "has-session", "-t", f"={session}"], capture_output=True, check=False)
     return proc.returncode == 0
 
 
 def kill_session(session: str) -> None:
     """Best-effort kill of a worker session (used by cleanup paths)."""
     tmux = require_tmux()
-    subprocess.run([tmux, "kill-session", "-t", f"={session}"], capture_output=True)
+    subprocess.run([tmux, "kill-session", "-t", f"={session}"], capture_output=True, check=False)
 
 
 def launch(name: str, cmd: str, home: Path, task: str | None = None, judge_cmd: str | None = None) -> dict[str, Any]:
@@ -177,15 +185,33 @@ class Observation:
     session_id: str | None
 
 
+def strip_ansi(text: str) -> str:
+    """Remove CSI/OSC escape sequences from pipe-pane captured output."""
+    return ANSI_RE.sub("", text)
+
+
 def parse_exit_sentinel(text: str) -> int | None:
-    """Extract the exit code from log text. Last match wins (most recent)."""
+    """Extract the exit code from log text. Last match wins (most recent).
+
+    DELIBERATELY no ANSI stripping here: the sentinel is emitted by our own
+    plain bash wrapper (launch()) — its bytes are written contiguously, so
+    escape sequences from surrounding output cannot appear INSIDE the token —
+    and the wrapper additionally appends a raw copy straight to the log
+    (race-free, never terminal-processed). Stripping would be harmless but
+    unnecessary; the parser stays byte-faithful to our own wrapper contract.
+    """
     matches = EXIT_SENTINEL_RE.findall(text)
     return int(matches[-1]) if matches else None
 
 
 def extract_session_id(text: str) -> str | None:
-    """Best-effort amplifier session-id extraction from worker log output."""
-    match = SESSION_ID_RE.search(text)
+    """Best-effort amplifier session-id extraction from worker log output.
+
+    Strips ANSI escape sequences first: the real amplifier CLI styles this
+    line (dim label, colored uuid), so the raw pipe-pane bytes have escape
+    codes between "Session ID:" and the uuid (see ANSI_RE note).
+    """
+    match = SESSION_ID_RE.search(strip_ansi(text))
     return match.group(1) if match else None
 
 

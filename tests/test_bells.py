@@ -265,17 +265,34 @@ class TestPacketBell:
         assert events_of(sup, "bell:error") == []
         assert len(sup.state.ring_candidates) == 1  # only the orphan id waits
 
-    def test_answered_packet_retires_unrung_candidate(self, home, queue):
-        pkt = make_packet(session_id="sid-orphan")
+    def test_answered_packet_retires_unrung_candidate_with_breadcrumb(self, home, queue):
+        pkt = make_packet(session_id="sid-orphan-123456")
         queue.write(pkt)
         ring = RingRecorder()
         sup = make_supervisor(home, queue, ring=ring)
         sup.tick()
-        assert sup.state.ring_candidates == {pkt.id: "sid-orphan"}
+        assert sup.state.ring_candidates == {pkt.id: "sid-orphan-123456"}
         queue.answer(pkt.id, "A")
         sup.tick()
+        sup.tick()  # no duplicate breadcrumb on later ticks
         assert sup.state.ring_candidates == {}  # the human got there without the bell
         assert ring.calls == []
+        # Loud-once breadcrumb: the packet came and went without ever joining a
+        # worker (extraction failure or unowned id) — exactly once, not spam.
+        unjoined = events_of(sup, "bell:unjoined")
+        assert len(unjoined) == 1
+        assert unjoined[0]["packet_id"] == pkt.id
+        assert unjoined[0]["session_id_prefix"] == "sid-orph"
+
+    def test_rung_packet_answered_emits_no_unjoined_breadcrumb(self, home, queue):
+        pkt = make_packet(session_id="sid-123")
+        queue.write(pkt)
+        sup = make_supervisor(home, queue, sessions=["am-w1"], observations={"am-w1": OBS_RUNNING_WITH_ID})
+        sup.tick()  # joins + rings
+        assert len(events_of(sup, "bell:rung")) == 1
+        queue.answer(pkt.id, "A")
+        sup.tick()
+        assert events_of(sup, "bell:unjoined") == []  # it joined; nothing to report
 
     def test_no_bells_disables_everything(self, home, queue):
         queue.write(make_packet(session_id="sid-123"))

@@ -214,7 +214,14 @@ class Supervisor:
             self.state.seen_pending.add(pkt.id)
             # An answered packet no longer needs a bell — retire any unrung
             # candidate (the human already reached it without the surface).
-            self.state.ring_candidates.pop(pkt.id, None)
+            # Retiring UNJOINED is made loud-once: the packet came and went
+            # without its source session id ever matching a worker — either
+            # the id never appeared in any worker.log (extraction failure —
+            # the DTU eval hit exactly this via ANSI-styled output) or the
+            # producer wrote an id no worker owns. One breadcrumb, not spam.
+            unjoined_sid = self.state.ring_candidates.pop(pkt.id, None)
+            if unjoined_sid is not None:
+                self.state.append_event("bell:unjoined", packet_id=pkt.id, session_id_prefix=unjoined_sid[:8])
             resolution = pkt.resolution.to_dict() if pkt.resolution is not None else None
             latency = (
                 _latency_seconds(pkt.created_at, pkt.resolution.answered_at) if pkt.resolution is not None else None
