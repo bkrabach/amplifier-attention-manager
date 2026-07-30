@@ -65,9 +65,9 @@ Concrete, working example (this repo's test-worker bundle, fetched via git):
 
 ```bash
 attention-manager dispatch portfix \
-  --task "migrate the config parser to the new schema" \
+  --task "migrate the config parser to the new schema; print MIGRATION-COMPLETE as your final line when done" \
   --bundle 'git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=bundles/test-worker.md' \
-  --judge 'cd ~/repos/thing && python -m pytest -q'
+  --judge 'grep MIGRATION-COMPLETE "$WORKER_LOG"'
 ```
 
 - `--bundle` takes anything `amplifier run -B` accepts: a git URI like the
@@ -82,17 +82,31 @@ attention-manager dispatch portfix \
   `loop:failed` (loud + bell). No judge → the worker finishes unjudged —
   but an unjudged worker that dies with a nonzero exit is still loud
   (`WORKER FAILED` notification + bell + `worker_failed` ledger entry).
-- Verify a judge before trusting it (the broken-test protocol):
+- **Where the judge runs (read this before writing your first judge):** the
+  judge does NOT run where the task did its work. It runs in the worker's
+  *state* directory `$ATTENTION_HOME/workers/<session>/` (contents:
+  `worker.log`, `meta.json` — not your repo), with `$WORKER_LOG` (absolute
+  path to the worker's captured output) and `$WORKER_EXIT` (the worker's
+  exit code; empty if the session died without one) exported. A
+  relative-path judge like `test -f status-a.txt` will fail even when the
+  work succeeded. Judge files in the work tree by ABSOLUTE path, or judge
+  the worker's output via `"$WORKER_LOG"` as in the example above. Full
+  contract: `context/judge-contract.md`.
+- Verify a judge before trusting it (the broken-test protocol). Runnable
+  verbatim — the first two lines create the artifacts the third one judges:
 
   ```bash
+  echo DONE > good.txt
+  echo "not finished" > broken.txt
   attention-manager judge verify --cmd 'grep -q DONE "$ARTIFACT"' --good good.txt --broken broken.txt
   ```
 
   `--cmd` runs via `bash -c` with `$ARTIFACT` set to the artifact path under
   test; it must PASS the known-good artifact AND FAIL the deliberately broken
-  one. (The dispatch-time `--judge` command instead runs in the worker's dir
-  with `WORKER_LOG`/`WORKER_EXIT` in its environment — a pytest judge like
-  the example above needs no `$ARTIFACT`.)
+  one. (The dispatch-time `--judge` command instead runs in the worker's
+  state dir with `WORKER_LOG`/`WORKER_EXIT` in its environment — see "Where
+  the judge runs" above — so a `"$WORKER_LOG"` judge like the dispatch
+  example needs no `$ARTIFACT`.)
 
 ## Making workers escalate (the NEEDS-HUMAN-DECISION protocol)
 
@@ -125,6 +139,12 @@ session bell rings — `sort=attention` floats it to the top, muxplex-deck shows
 amber. You (or the muxplex UI) clear bells; the manager never does. Hop into
 any session from the browser at any time — the manager won't fight you for
 the view.
+
+Bells are transient: a worker's tmux session ends shortly after the worker
+finishes and takes its bell flag with it, so without muxplex there may be no
+bell left to see. The notify sink (`file:` / `ntfy:` / `console`) is the
+durable record of escalations and finish lines — bells are the live-attention
+surface, not history.
 
 NOTE: muxplex views filter what surfaces. If your active view is a curated one
 (not "all"), belled `am-*` sessions won't appear in it — add them to the view

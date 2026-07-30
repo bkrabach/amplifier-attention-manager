@@ -5,11 +5,14 @@ writes packets with its own minimal IO, and the background thread answers via
 the ROOT attention_manager queue library against the same files.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_module_tool_request_decision import RequestDecisionTool, mount
 
+from attention_manager.cli import main as cli_main
 from attention_manager.queue import PacketQueue
 
 FAST = {"poll_interval_s": 0.05, "max_wait_seconds": 30}
@@ -52,6 +55,50 @@ class TestMount:
         assert isinstance(tool.description, str) and tool.description
         assert isinstance(tool.input_schema, dict)
         assert callable(tool.execute)
+
+
+class TestWorkUnitLinkage:
+    """Worker↔packet linkage (UX round 2, Sam: SOURCE column showed '-' for
+    dispatched workers): dispatch exports ATTENTION_WORK_UNIT into the
+    worker's env; the module stamps it into source.work_unit; `queue list`'s
+    SOURCE column names the worker that raised the packet."""
+
+    INPUT: ClassVar[dict] = {"question": "A or B?", "options": OPTIONS}
+
+    async def _pending_packet(self, queue: PacketQueue):
+        for _ in range(200):
+            pending = queue.list_pending()
+            if pending:
+                return pending[0]
+            await asyncio.sleep(0.02)
+        raise TimeoutError("no pending packet appeared")
+
+    async def test_env_work_unit_stamped_and_shown_in_source_column(self, queue_root, monkeypatch, capsys):
+        monkeypatch.setenv("ATTENTION_WORK_UNIT", "portfix")
+        tool = RequestDecisionTool(config=FAST)
+        task = asyncio.create_task(tool.execute(self.INPUT))
+        queue = PacketQueue(queue_root)
+        pending = await self._pending_packet(queue)
+        assert pending.source.work_unit == "portfix"
+
+        # The CLI's SOURCE column names the worker while the packet is pending.
+        assert cli_main(["queue", "list"]) == 0
+        out = capsys.readouterr().out
+        assert "SOURCE" in out and "portfix" in out
+
+        queue.answer(pending.id, "A")
+        result = await task
+        assert result.success
+
+    async def test_no_work_unit_without_env(self, queue_root, monkeypatch):
+        monkeypatch.delenv("ATTENTION_WORK_UNIT", raising=False)
+        tool = RequestDecisionTool(config=FAST)
+        task = asyncio.create_task(tool.execute(self.INPUT))
+        queue = PacketQueue(queue_root)
+        pending = await self._pending_packet(queue)
+        assert pending.source.work_unit is None
+        queue.answer(pending.id, "A")
+        assert (await task).success
 
 
 class TestExecuteHappyPath:

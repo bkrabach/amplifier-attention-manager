@@ -63,6 +63,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_QUEUE_DIR = "~/.amplifier/attention/queue"
 ENV_QUEUE_DIR = "ATTENTION_QUEUE_DIR"
+# Worker↔packet linkage convention (context/packet-schema.md): the dispatcher
+# exports the work-unit name into the worker's environment; when set, packets
+# carry it as source.work_unit so `queue list`'s SOURCE column can name the
+# worker that raised each packet.
+ENV_WORK_UNIT = "ATTENTION_WORK_UNIT"
 SCHEMA_VERSION = 1
 MAX_CONTEXT_CHARS = 8000
 DEFAULT_POLL_INTERVAL_S = 1.0
@@ -160,6 +165,9 @@ class PacketApprovalProvider:
             urgency["on_timeout"] = {"action": "fail-loud"}
         source: dict[str, Any] = {"kind": "permission"}
         links: dict[str, Any] = {}
+        work_unit = os.environ.get(ENV_WORK_UNIT)
+        if work_unit:
+            source["work_unit"] = work_unit
         # Provenance + re-entry, when cheaply available (same getattr pattern
         # as tool-request-decision). Absent a coordinator session id, links
         # stays empty — links.resume is producer-dependent by contract.

@@ -7,6 +7,7 @@ ONLY when `which tmux` is empty, and the reason must be unmissable).
 """
 
 import shutil
+import subprocess
 import time
 import uuid
 
@@ -132,6 +133,36 @@ class TestWithRealTmux:
         log_path = home / "workers" / session / "worker.log"
         assert self._wait_for(lambda: workers.observe(session, log_path).sentinel_seen)
         assert workers.observe(session, log_path).exit_code == 7
+
+    def test_exit_style_command_still_writes_sentinel(self, home, unique_name):
+        """Regression (UX round 2, Sam STRIKE #1): a bare `exit 3` worker
+        command used to terminate the wrapper shell itself, skipping the
+        sentinel — the session died with no exit line and dispatch's
+        early-death check had nothing to warn on. The subshell in the launch
+        wrapper contains the exit; the sentinel must always land."""
+        workers.launch(unique_name, "exit 3", home, task="instant fail probe")
+        session = f"am-{unique_name}"
+        log_path = home / "workers" / session / "worker.log"
+        assert self._wait_for(lambda: workers.observe(session, log_path).sentinel_seen), (
+            f"exit sentinel never appeared for an exit-style command: "
+            f"{log_path.read_text(encoding='utf-8', errors='replace')!r}"
+        )
+        assert workers.observe(session, log_path).exit_code == 3
+
+    def test_launch_exports_work_unit_env(self, home, unique_name):
+        """Worker↔packet linkage: launch() exports ATTENTION_WORK_UNIT=<name>
+        into the tmux session so packet producers can stamp source.work_unit."""
+        workers.launch(unique_name, "sleep 30", home)
+        session = f"am-{unique_name}"
+        tmux = workers.require_tmux()
+        proc = subprocess.run(
+            [tmux, "show-environment", "-t", f"={session}", workers.ENV_WORK_UNIT],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"show-environment failed: {proc.stderr}"
+        assert proc.stdout.strip() == f"{workers.ENV_WORK_UNIT}={unique_name}"
 
     def test_session_dies_after_sleep_window(self, home, unique_name):
         workers.launch(unique_name, "true", home)

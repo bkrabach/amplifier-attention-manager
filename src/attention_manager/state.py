@@ -115,6 +115,11 @@ def new_worker_record(
         "finished": False,
         "exit_code": None,
         "amplifier_session_id": None,
+        # Loop outcome (persisted at finish by the supervisor, step 4): a
+        # judge-failed worker must never render like a success in `status`
+        # (defect: loop_failed and loop_closed both showed "finished(rc=0)").
+        "judged": False,
+        "judge_result": None,  # "closed" | "failed" | None (no judge ran)
     }
 
 

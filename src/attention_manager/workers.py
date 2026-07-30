@@ -41,6 +41,11 @@ from .queue import ENV_QUEUE_DIR
 from .state import ENV_HOME, SESSION_PREFIX
 
 EXIT_SENTINEL_TEMPLATE = "__AM_WORKER_EXIT:{code}__"
+# Worker↔packet linkage convention: dispatch exports the work-unit name into
+# the worker's environment; the packet producers (tool-request-decision,
+# hooks-packet-approval) read it into source.work_unit so `queue list`'s
+# SOURCE column can name the worker that raised each packet.
+ENV_WORK_UNIT = "ATTENTION_WORK_UNIT"
 EXIT_SENTINEL_RE = re.compile(r"__AM_WORKER_EXIT:(\d+)__")
 # Best-effort: amplifier CLI prints "Session ID: <uuid>" near startup.
 SESSION_ID_RE = re.compile(r"Session ID:\s*([0-9a-fA-F][0-9a-fA-F-]{7,})")
@@ -140,13 +145,24 @@ def launch(name: str, cmd: str, home: Path, task: str | None = None, judge_cmd: 
     # The leading guard sleep lets pipe-pane attach before the command produces
     # output — without it, a near-instant command's pane output is emitted
     # before capture starts and is lost from the log.
-    wrapped = f'sleep 0.5; {cmd}; ec=$?; echo "__AM_WORKER_EXIT:${{ec}}__"; echo "__AM_WORKER_EXIT:${{ec}}__" >> {qlog}; sleep 3'
+    # The command runs in a SUBSHELL: an exit-style worker command (e.g.
+    # `--worker-cmd "exit 3"`) would otherwise terminate the wrapper shell
+    # itself, skipping the sentinel entirely — the session died with no exit
+    # line, so dispatch's early-death check had nothing to warn on (UX round
+    # 2, Sam STRIKE #1, reproduced twice). The subshell contains the exit;
+    # ec captures its code; the sentinel is never lost.
+    wrapped = f'sleep 0.5; ( {cmd} ); ec=$?; echo "__AM_WORKER_EXIT:${{ec}}__"; echo "__AM_WORKER_EXIT:${{ec}}__" >> {qlog}; sleep 3'
 
     env_args: list[str] = []
     for var in (ENV_QUEUE_DIR, ENV_HOME, "PYTHONPATH"):
         value = os.environ.get(var)
         if value:
             env_args += ["-e", f"{var}={value}"]
+    # Worker↔packet linkage: export the work-unit name so packet producers
+    # can stamp source.work_unit (defect: `queue list` SOURCE showed "-" for
+    # dispatched workers — with several running you had to open each packet
+    # to find who was blocked).
+    env_args += ["-e", f"{ENV_WORK_UNIT}={name}"]
 
     try:
         subprocess.run(

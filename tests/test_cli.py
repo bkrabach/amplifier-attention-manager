@@ -1,6 +1,8 @@
 """CLI tests — invoke main() directly with ATTENTION_QUEUE_DIR isolation."""
 
 import json
+import shutil
+import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -10,8 +12,16 @@ from attention_manager import cli, workers
 from attention_manager.cli import format_week_metric, main, week_metric
 from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
-from attention_manager.state import SupervisorState
+from attention_manager.state import SupervisorState, new_worker_record
 from attention_manager.workers import Observation
+
+requires_tmux = pytest.mark.skipif(
+    shutil.which("tmux") is None,
+    reason=(
+        "LOUD SKIP: tmux is NOT installed on this machine — the real-tmux dispatch "
+        "regression did NOT run. Install tmux to exercise it for real."
+    ),
+)
 
 
 @pytest.fixture
@@ -184,6 +194,116 @@ class TestDispatchEarlyDeath:
         assert "ERROR" in err and "exit 1" in err
         events = SupervisorState(home).read_events()
         assert any(e["event"] == "worker:dispatch_failed" for e in events)
+
+
+@requires_tmux
+class TestDispatchEarlyDeathRealTmux:
+    """Regression (UX round 2, Sam STRIKE #1, reproduced twice): `dispatch
+    --worker-cmd "exit 3"` printed the normal success line and exited 0,
+    contradicting DOGFOOD's 'no more silent instant deaths' guarantee. Root
+    cause: a bare `exit 3` terminated the launch wrapper shell itself, so the
+    exit sentinel was never written — the session died with no exit line and
+    the early-death check had nothing to warn on. The wrapper now runs the
+    command in a subshell, so the sentinel always lands and the nonzero-
+    sentinel warning fires REGARDLESS of session liveness (the sleep-3 tail
+    keeps the session alive through the early-death window)."""
+
+    def test_worker_cmd_exit_3_is_loud(self, home, queue_root, capsys):
+        name = f"exit3-{uuid.uuid4().hex[:8]}"
+        try:
+            rc = main(["dispatch", name, "--task", "instant fail probe", "--worker-cmd", "exit 3"])
+        finally:
+            workers.kill_session(workers.session_name(name))  # cleanup, best-effort
+        err = capsys.readouterr().err
+        assert rc == 1, f"dispatch printed success for an instantly-dead worker; stderr: {err!r}"
+        assert "ERROR" in err and "exit 3" in err and "worker.log" in err
+        events = SupervisorState(home).read_events()
+        assert any(e["event"] == "worker:dispatch_failed" for e in events)
+
+
+class TestStatusLoopOutcome:
+    """Regression (UX round 2, Sam STRIKE #2): a judge-failed worker rendered
+    identically to a success — both 'finished(rc=0)' — and --json status had
+    no judge/loop field at all. status must show the loop outcome per worker
+    (closed / failed / unjudged), and when no supervisor verdict exists it
+    must say what is knowable honestly ('not judged yet'), never fabricate."""
+
+    @pytest.fixture(autouse=True)
+    def _no_tmux(self, monkeypatch):
+        monkeypatch.setattr(workers, "list_am_sessions", list)
+
+    def _finished_obs(self, exit_code=0):
+        return Observation(alive=False, exit_code=exit_code, sentinel_seen=True, session_id=None)
+
+    def _seed(self, home, session, **flags):
+        """Persist a supervisor-observed worker record into state.json."""
+        state = SupervisorState(home)
+        record = new_worker_record(name=session.removeprefix("am-"), session=session, task="t")
+        record.update(flags)
+        state.workers[session] = record
+        state.save()
+
+    def test_judge_failed_loop_shows_failed(self, home, queue_root, monkeypatch, capsys):
+        self._seed(home, "am-p3", finished=True, exit_code=0, judge_cmd="false", judged=True, judge_result="failed")
+        monkeypatch.setattr(workers, "observe", lambda s, p: self._finished_obs())
+        assert main(["status"]) == 0
+        out = capsys.readouterr().out
+        assert "LOOP" in out and "failed" in out
+
+    def test_judge_closed_loop_shows_closed(self, home, queue_root, monkeypatch, capsys):
+        self._seed(home, "am-p3c", finished=True, exit_code=0, judge_cmd="true", judged=True, judge_result="closed")
+        monkeypatch.setattr(workers, "observe", lambda s, p: self._finished_obs())
+        assert main(["status"]) == 0
+        assert "closed" in capsys.readouterr().out
+
+    def test_failed_and_closed_render_differently(self, home, queue_root, monkeypatch, capsys):
+        """The exact strike: probe3 (loop_failed) and probe3c (loop_closed)
+        must no longer be indistinguishable in status."""
+        state = SupervisorState(home)
+        r1 = new_worker_record(name="p3", session="am-p3", judge_cmd="false")
+        r1.update(finished=True, exit_code=0, judged=True, judge_result="failed")
+        r2 = new_worker_record(name="p3c", session="am-p3c", judge_cmd="true")
+        r2.update(finished=True, exit_code=0, judged=True, judge_result="closed")
+        state.workers = {"am-p3": r1, "am-p3c": r2}
+        state.save()
+        monkeypatch.setattr(workers, "observe", lambda s, p: self._finished_obs())
+        assert main(["--json", "status"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        loops = {row["session"]: row["loop"] for row in data["workers"]}
+        assert loops == {"am-p3": "failed", "am-p3c": "closed"}
+
+    def test_unjudged_finish_shows_unjudged(self, home, queue_root, monkeypatch, capsys):
+        self._seed(home, "am-nojudge", finished=True, exit_code=0)
+        monkeypatch.setattr(workers, "observe", lambda s, p: self._finished_obs())
+        assert main(["status"]) == 0
+        assert "unjudged" in capsys.readouterr().out
+
+    def test_no_supervisor_verdict_is_honest(self, home, queue_root, monkeypatch, capsys):
+        """Worker finished with a judge configured but the supervisor has not
+        judged it (no snapshot verdict): status says 'not judged yet' — what
+        is knowable, never a fabricated outcome."""
+        worker_dir = home / "workers" / "am-fresh"
+        worker_dir.mkdir(parents=True)
+        (worker_dir / "meta.json").write_text(
+            json.dumps({"name": "fresh", "session": "am-fresh", "task": "t", "judge_cmd": "true"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(workers, "observe", lambda s, p: self._finished_obs())
+        assert main(["status"]) == 0
+        out = capsys.readouterr().out
+        assert "finished(rc=0)" in out and "not judged yet" in out
+
+    def test_running_worker_has_no_loop_outcome(self, home, queue_root, monkeypatch, capsys):
+        self._seed(home, "am-live", judge_cmd="true")
+        monkeypatch.setattr(
+            workers,
+            "observe",
+            lambda s, p: Observation(alive=True, exit_code=None, sentinel_seen=False, session_id=None),
+        )
+        assert main(["--json", "status"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["workers"][0]["state"] == "running"
+        assert data["workers"][0]["loop"] is None
 
 
 class TestWeekMetric:

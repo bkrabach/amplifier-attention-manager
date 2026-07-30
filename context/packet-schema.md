@@ -79,7 +79,12 @@ pending.
     "kind": "decision",
     // OPTIONAL. Producing Amplifier session id (for links.resume / hop-in).
     "session_id": "abc123",
-    // OPTIONAL. Work-unit name if part of a dispatched unit.
+    // OPTIONAL. Work-unit name if part of a dispatched unit. Set by the
+    // workunit runner directly, OR read from the $ATTENTION_WORK_UNIT
+    // environment variable — `dispatch <name>` exports it into the worker's
+    // environment, and producers (tool-request-decision,
+    // hooks-packet-approval) stamp it here when set. `queue list`'s SOURCE
+    // column renders it.
     "work_unit": "portfix",
     // OPTIONAL. muxplex tmux session name (hop-in target), e.g. "am-portfix-3".
     "muxplex_session": "am-portfix-3"

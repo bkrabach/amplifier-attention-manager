@@ -275,6 +275,11 @@ class Supervisor:
                 }
                 if judge_result is not None:
                     fields["judge_result"] = "closed" if judge_result.passed else "failed"
+                # Persist the loop outcome on the worker record so `status`
+                # can render it (defect: judge-failed loops were
+                # indistinguishable from successes outside the ledger).
+                record["judged"] = judge_result is not None
+                record["judge_result"] = fields.get("judge_result")
                 if not obs.sentinel_seen:
                     fields["sentinel_missing"] = True  # dead session, no exit line — loud
                 self.state.append_event("worker:finished", **fields)

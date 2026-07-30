@@ -432,6 +432,32 @@ def _worker_state(record: dict, obs: workers.Observation) -> str:
     return "dead(no sentinel)"
 
 
+def _loop_outcome(record: dict, obs: workers.Observation) -> str | None:
+    """The worker's loop outcome, from what is actually KNOWN. Never fabricated.
+
+    Defect (UX round 2, Sam STRIKE #2): a judge-failed loop rendered
+    identically to a success — both "finished(rc=0)" — while only the ledger
+    knew loop_failed. The supervisor now persists judged/judge_result on the
+    worker record at finish; status renders it:
+
+    - "closed" / "failed"  — the persisted judge result (loop:closed/loop:failed)
+    - "unjudged"           — finished with no judge configured (never will be judged)
+    - "not judged yet"     — finished with a judge, but no supervisor verdict is
+                             on disk (supervisor hasn't processed the finish, or
+                             a pre-upgrade snapshot) — honest, not a guess
+    - None                 — still running (rendered "-")
+    """
+    finished = obs.sentinel_seen or not obs.alive or record.get("finished")
+    if not finished:
+        return None
+    judge_result = record.get("judge_result")
+    if judge_result in ("closed", "failed"):
+        return judge_result
+    if not record.get("judge_cmd"):
+        return "unjudged"
+    return "not judged yet"
+
+
 def _cmd_status(queue: PacketQueue, as_json: bool) -> int:
     state = SupervisorState()
     state.load()
@@ -443,6 +469,7 @@ def _cmd_status(queue: PacketQueue, as_json: bool) -> int:
             {
                 "session": session,
                 "state": _worker_state(record, obs),
+                "loop": _loop_outcome(record, obs),
                 "exit_code": obs.exit_code if obs.sentinel_seen else record.get("exit_code"),
                 "task": record.get("task"),
             }
@@ -454,11 +481,13 @@ def _cmd_status(queue: PacketQueue, as_json: bool) -> int:
     if not rows:
         print("no workers")
     else:
-        header = f"{'SESSION':<24} {'STATE':<20} TASK"
+        header = f"{'SESSION':<24} {'STATE':<20} {'LOOP':<15} TASK"
         print(header)
         print("-" * len(header))
         for row in rows:
-            print(f"{row['session']:<24} {row['state']:<20} {_truncate(row['task'] or '-', 50)}")
+            print(
+                f"{row['session']:<24} {row['state']:<20} {row['loop'] or '-':<15} {_truncate(row['task'] or '-', 50)}"
+            )
     print(f"pending packets: {pending_count}")
     return 0
 
@@ -714,7 +743,15 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_p = sub.add_parser("dispatch", help="launch a worker into an am-* tmux session")
     dispatch_p.add_argument("name", help="worker name (tmux session becomes am-<name>)")
     dispatch_p.add_argument("--task", required=True, help="the task text for the worker")
-    dispatch_p.add_argument("--bundle", default=None, help="bundle URI passed to 'amplifier run -B'")
+    dispatch_p.add_argument(
+        "--bundle",
+        default=None,
+        help=(
+            "bundle URI passed to 'amplifier run -B'. NOTE: workers can only escalate (write packets) "
+            "if this bundle composes the packet-escalation behavior — a plain bundle blocks or "
+            "improvises instead of writing a packet (see docs/DOGFOOD.md, 'Making workers escalate')"
+        ),
+    )
     dispatch_p.add_argument("--worker-cmd", dest="worker_cmd", default=None, help="full command override")
     dispatch_p.add_argument(
         "--judge",

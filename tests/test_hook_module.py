@@ -95,6 +95,20 @@ class TestProvenanceLinks:
         packet = provider.build_packet(make_request())
         assert packet["links"]["resume"] == "amplifier session resume sess-88"
 
+    def test_build_packet_stamps_work_unit_from_env(self, monkeypatch):
+        """Worker↔packet linkage: dispatch exports ATTENTION_WORK_UNIT into
+        the worker's env; permission packets carry it as source.work_unit."""
+        monkeypatch.setenv("ATTENTION_WORK_UNIT", "portfix")
+        provider = PacketApprovalProvider({})
+        packet = provider.build_packet(make_request())
+        assert packet["source"]["work_unit"] == "portfix"
+
+    def test_build_packet_no_work_unit_without_env(self, monkeypatch):
+        monkeypatch.delenv("ATTENTION_WORK_UNIT", raising=False)
+        provider = PacketApprovalProvider({})
+        packet = provider.build_packet(make_request())
+        assert "work_unit" not in packet["source"]
+
 
 class TestGatePolicy:
     """gate_tools config → tool:pre policy hook that survives policy_driven_only.

@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_QUEUE_DIR = "~/.amplifier/attention/queue"
 ENV_QUEUE_DIR = "ATTENTION_QUEUE_DIR"
+# Worker↔packet linkage convention (context/packet-schema.md): the dispatcher
+# exports the work-unit name into the worker's environment; when set, packets
+# carry it as source.work_unit so `queue list`'s SOURCE column can name the
+# worker that raised each packet.
+ENV_WORK_UNIT = "ATTENTION_WORK_UNIT"
 SCHEMA_VERSION = 1
 MAX_CONTEXT_CHARS = 8000
 VALID_TIERS = ("batch", "today", "now")
@@ -232,6 +237,9 @@ class RequestDecisionTool:
         urgency_in = input_data.get("urgency") or {}
         source: dict[str, Any] = {"kind": "decision"}
         links: dict[str, Any] = {}
+        work_unit = os.environ.get(ENV_WORK_UNIT)
+        if work_unit:
+            source["work_unit"] = work_unit
         session_id = getattr(self._coordinator, "session_id", None)
         if session_id:
             source["session_id"] = str(session_id)

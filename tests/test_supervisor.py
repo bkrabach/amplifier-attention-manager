@@ -175,6 +175,35 @@ class TestWorkerLifecycle:
         sup.tick()
         assert sup.state.workers["am-w1"]["amplifier_session_id"] == "abc-123-def"
 
+    def test_judge_result_persisted_on_worker_record(self, home, queue):
+        """Loop outcome must survive on the worker record (not just the
+        ledger) so `status` can render closed/failed — defect (UX round 2,
+        Sam STRIKE #2): a judge-failed loop was indistinguishable from a
+        success in status."""
+        obs = Observation(alive=False, exit_code=0, sentinel_seen=True, session_id=None)
+        sup = make_supervisor(home, queue, sessions=["am-w1"], observations={"am-w1": obs})
+        sup.state.adopt_workers(["am-w1"])
+        sup.state.workers["am-w1"]["judge_cmd"] = "false"  # real judge, fails
+        sup.tick()
+        record = sup.state.workers["am-w1"]
+        assert record["judged"] is True and record["judge_result"] == "failed"
+
+        # And a passing judge persists "closed".
+        (home / "workers" / "am-w2").mkdir(parents=True, exist_ok=True)
+        sup2 = make_supervisor(home, queue, sessions=["am-w2"], observations={"am-w2": obs})
+        sup2.state.adopt_workers(["am-w2"])
+        sup2.state.workers["am-w2"]["judge_cmd"] = "true"  # real judge, passes
+        sup2.tick()
+        record2 = sup2.state.workers["am-w2"]
+        assert record2["judged"] is True and record2["judge_result"] == "closed"
+
+    def test_unjudged_finish_persists_no_judge_result(self, home, queue):
+        obs = Observation(alive=False, exit_code=0, sentinel_seen=True, session_id=None)
+        sup = make_supervisor(home, queue, sessions=["am-w1"], observations={"am-w1": obs})
+        sup.tick()
+        record = sup.state.workers["am-w1"]
+        assert record["judged"] is False and record["judge_result"] is None
+
 
 class TestUnjudgedFailureIsLoud:
     """Defect (UX round 1): an unjudged worker dying rc=1 produced ZERO signal
