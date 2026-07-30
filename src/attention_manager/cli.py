@@ -11,7 +11,7 @@ Commands:
                                 [--batch-window N] [--batch-max N]
                                 [--triage] [--triage-every N]
                                 [--triage-bundle URI] [--triage-timeout N]
-                                [--judge-timeout N]
+                                [--judge-timeout N] [--no-bells]
     attention-manager judge verify --cmd CMD --good PATH --broken PATH [--timeout N]
     attention-manager triage --once [--bundle URI] [--timeout N]
     attention-manager auto list [--json]
@@ -154,6 +154,7 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
         triage_every=triage_every,
         recipes_every=recipes_every,
         judge_timeout_s=args.judge_timeout,
+        bells=not args.no_bells,
     )
     if supervisor.triage_runner is not None:
         if args.triage_bundle:
@@ -577,6 +578,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_RECIPES_EVERY_TICKS,
         help=f"ticks between recipe-gate polls when --recipes is set (default {DEFAULT_RECIPES_EVERY_TICKS})",
+    )
+    supervise_p.add_argument(
+        "--no-bells",
+        dest="no_bells",
+        action="store_true",
+        help=(
+            "disable muxplex bells (default: on — packet:created with a resolvable worker "
+            "session and loop:failed ring the worker's tmux bell so muxplex/deck surface it)"
+        ),
     )
     supervise_p.add_argument(
         "--judge-timeout",

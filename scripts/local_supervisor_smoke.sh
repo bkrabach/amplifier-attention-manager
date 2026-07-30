@@ -3,13 +3,16 @@
 # Same discipline as local_roundtrip.sh (see context/judge-contract.md).
 #
 # Happy path: two fake workers are dispatched into am-* tmux sessions via
-# --worker-cmd (each writes a decision packet via the ROOT queue lib and polls
-# for its resolution — cross-checking module-free). The supervisor observes
-# them, emits packet:created for both, sends ONE batched notification covering
-# both packets, survives a mid-run kill+restart with no duplicate events, and
-# after both packets are answered via the CLI, both workers exit 0 and the
-# supervisor emits packet:answered + worker:finished(judged:false) for each,
-# with the full story in the ledger.
+# --worker-cmd (each echoes an amplifier-style "Session ID: <uuid>" line, then
+# writes a decision packet carrying that same uuid as source.session_id via
+# the ROOT queue lib and polls for its resolution — cross-checking
+# module-free). The supervisor observes them, emits packet:created for both,
+# joins each packet to its worker via the session id and RINGS the worker's
+# tmux bell (window_bell_flag=1 + bell:rung events — the muxplex surface),
+# sends ONE batched notification covering both packets, survives a mid-run
+# kill+restart with no duplicate events, and after both packets are answered
+# via the CLI, both workers exit 0 and the supervisor emits packet:answered +
+# worker:finished(judged:false) for each, with the full story in the ledger.
 #
 # Exit 0 + "PASS: <reason>" or exit 1 + "FAIL: <reason>".
 #
@@ -46,19 +49,25 @@ cleanup() {
 trap cleanup EXIT
 
 write_fake_worker() {
-    # $1 = destination file. Worker: write a decision packet (root queue lib),
-    # poll for resolution, exit 0 iff answered with the expected option.
+    # $1 = destination file. Worker: announce an amplifier-style session id
+    # (observe() extracts it from worker.log — the bell-join key), write a
+    # decision packet carrying the SAME id as source.session_id (root queue
+    # lib), poll for resolution, exit 0 iff answered with the expected option.
     cat >"$1" <<'PY'
 import sys
+import uuid
+
 from attention_manager.packet import Option, Packet, Source
 from attention_manager.queue import PacketQueue
 
 name, expected, timeout_s = sys.argv[1], sys.argv[2], float(sys.argv[3])
+sid = str(uuid.uuid4())
+print(f"Session ID: {sid}", flush=True)  # captured by pipe-pane -> worker.log -> observe()
 q = PacketQueue()
 p = Packet(
     question=f"smoke [{name}]: proceed with option {expected}?",
     options=[Option(id="A", label="Proceed"), Option(id="B", label="Abort")],
-    source=Source(kind="decision", muxplex_session=f"am-{name}"),
+    source=Source(kind="decision", session_id=sid, muxplex_session=f"am-{name}"),
 )
 q.write(p)
 print(f"packet written: {p.id}", flush=True)
@@ -140,6 +149,21 @@ run_smoke() {
         return 1
     fi
     echo "  2 packet:created events observed"
+
+    # Muxplex bell surface: each packet joins to its worker via the session id
+    # (late binding tolerated) and rings the worker's tmux bell exactly once.
+    if ! wait_for_event_count "bell:rung" 2 20; then
+        echo "FAIL: expected 2 bell:rung events, got $(count_events bell:rung) (sup log: $(tail -5 "$SUP_LOG"))"
+        return 1
+    fi
+    for s in "${SESSIONS[@]}"; do
+        flag="$(tmux list-windows -t "=$s" -F '#{window_bell_flag}' | head -1)"
+        if [ "$flag" != "1" ]; then
+            echo "FAIL: expected window_bell_flag=1 on $s after packet bell, got '$flag'"
+            return 1
+        fi
+    done
+    echo "  2 bell:rung events + window_bell_flag=1 on both am-* sessions"
 
     # ONE batch notification containing both packets (batching proof).
     local batch_ok=""

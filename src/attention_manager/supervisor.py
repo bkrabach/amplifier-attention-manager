@@ -47,6 +47,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
+from . import bells as bells_mod
 from . import workers as workers_mod
 from .judge import DEFAULT_JUDGE_TIMEOUT_S, JudgeResult, run_judge
 from .notify import NotificationBatcher, parse_sink
@@ -101,6 +102,8 @@ class Supervisor:
         recipes_every: int | None = None,
         recipe_poller: RecipeGatePoller | None = None,
         judge_timeout_s: float = DEFAULT_JUDGE_TIMEOUT_S,
+        bells: bool = True,
+        ring: Callable[[str], None] | None = None,
         err: TextIO | None = None,
     ):
         self.state = SupervisorState(home)
@@ -110,6 +113,14 @@ class Supervisor:
         self.judge_timeout_s = judge_timeout_s
         self._list_sessions = list_sessions or workers_mod.list_am_sessions
         self._observe = observe or workers_mod.observe
+        # Tier-3 muxplex bells: ON by default (the supervise path already
+        # requires tmux, so "when tmux is present" holds by construction);
+        # `supervise --no-bells` disables. `ring` is an injectable seam like
+        # list_sessions/observe so the join/idempotency logic is unit-testable
+        # without tmux (real ringing is covered by test_bells.py + the smoke).
+        self.bells = bells
+        self._ring = ring or bells_mod.ring_bell
+        self._bell_error_sessions: set[str] = set()
         self._err = err or sys.stderr
         self._stop = False
         self._warned_no_sink = False
@@ -181,6 +192,14 @@ class Supervisor:
                 muxplex_session=pkt.source.muxplex_session,
             )
             self.state.ledger_append("packet_created", packet_id=pkt.id, question=pkt.question, tier=pkt.urgency.tier)
+            if self.bells and pkt.source.session_id:
+                # Bell join is deferred to _ring_bells (after _observe_workers)
+                # because the worker's amplifier session id may appear in its
+                # log on this tick — or a LATER one (late binding). Packets
+                # without a source session_id (recipe gates, seeded packets,
+                # standalone workunits) never become candidates: no bell, no
+                # error, no event spam.
+                self.state.ring_candidates[pkt.id] = pkt.source.session_id
             if self.batcher is not None:
                 self.batcher.enqueue(pkt.id, pkt.question)
             else:
@@ -193,6 +212,9 @@ class Supervisor:
             # A packet first seen already-answered never fires packet:created —
             # it no longer needs attention. Mark it past-pending too.
             self.state.seen_pending.add(pkt.id)
+            # An answered packet no longer needs a bell — retire any unrung
+            # candidate (the human already reached it without the surface).
+            self.state.ring_candidates.pop(pkt.id, None)
             resolution = pkt.resolution.to_dict() if pkt.resolution is not None else None
             latency = (
                 _latency_seconds(pkt.created_at, pkt.resolution.answered_at) if pkt.resolution is not None else None
@@ -330,6 +352,68 @@ class Supervisor:
             self.batcher.enqueue(session, f"LOOP FAILED: {name} — {result.reason}", kind="finish_line_failed")
         else:
             self._warn_notifications_disabled()
+        # A failed loop needs the human — surface it on the muxplex bell. Rings
+        # at most once per loop_failed by construction: loop:failed itself is
+        # emitted exactly once per worker (the persisted `finished` flag gates
+        # re-observation, across restarts too).
+        if self.bells:
+            self._try_ring(session, trigger="loop_failed")
+
+    # -- bells (Tier-3 muxplex surface: needs-attention = tmux bell) -----------------
+
+    def _try_ring(self, session: str, trigger: str, packet_id: str | None = None) -> bool:
+        """Ring one session's bell; emit bell:rung on success.
+
+        Failure policy (never crash the loop, don't retry-spam): ONE loud
+        bell:error event + stderr line per session, then quiet for that
+        session. Returns True iff the bell actually rang.
+        """
+        fields: dict[str, Any] = {"session": session, "trigger": trigger}
+        if packet_id is not None:
+            fields["packet_id"] = packet_id
+        try:
+            self._ring(session)
+        except Exception as e:  # noqa: BLE001 — boundary: bell trouble must not kill supervision
+            if session not in self._bell_error_sessions:
+                self._bell_error_sessions.add(session)
+                self.state.append_event("bell:error", error=str(e), **fields)
+                print(f"ERROR: bell ring failed for {session}: {e}", file=self._err)
+            return False
+        self.state.append_event("bell:rung", **fields)
+        return True
+
+    def _ring_bells(self) -> None:
+        """Ring worker bells for created packets (runs AFTER _observe_workers).
+
+        Join: packet.source.session_id ↔ the amplifier session id observe()
+        extracted from the worker's log. The id may appear in worker.log
+        AFTER the packet is created (late binding), so unjoined candidates
+        are kept and retried every tick until rung or answered. Candidates
+        and the rung set live in state.json (D5): a restart neither re-rings
+        nor drops a not-yet-joined packet.
+
+        No matching worker (recipe gates, standalone workunits, seeded
+        packets, id never observed): the candidate just waits — no bell, no
+        error, no event spam. A failed ring retires the candidate (one loud
+        bell:error per session — see _try_ring — never per-tick retries).
+        """
+        if not self.bells or not self.state.ring_candidates:
+            return
+        by_amplifier_id: dict[str, str] = {
+            record["amplifier_session_id"]: session
+            for session, record in self.state.workers.items()
+            if record.get("amplifier_session_id")
+        }
+        for packet_id in sorted(self.state.ring_candidates):
+            if packet_id in self.state.rung_packets:  # already rung (e.g. pre-restart)
+                del self.state.ring_candidates[packet_id]
+                continue
+            session = by_amplifier_id.get(self.state.ring_candidates[packet_id])
+            if session is None:
+                continue  # late binding: no worker claims this id yet; retry next tick
+            del self.state.ring_candidates[packet_id]
+            if self._try_ring(session, trigger="packet", packet_id=packet_id):
+                self.state.rung_packets.add(packet_id)
 
     # -- notifications --------------------------------------------------------------
 
@@ -457,6 +541,7 @@ class Supervisor:
     def tick(self) -> None:
         self._scan_packets()
         self._observe_workers()
+        self._ring_bells()  # after observation: the packet↔worker join needs fresh session ids
         self._maybe_triage()
         self._maybe_recipes()
         self._tick_count += 1
@@ -487,6 +572,7 @@ class Supervisor:
                 notify=self.batcher.sink.name if self.batcher is not None else None,
                 triage_every=self.triage_every,
                 recipes_every=self.recipes_every,
+                bells=self.bells,
             )
             if once:
                 self.tick()

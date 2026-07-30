@@ -140,6 +140,9 @@ S4_WORKERS: dict[str, dict[str, Any]] = {
     },
 }
 
+S4_BELL_WAIT_S = 30.0  # budget for bell:rung after packet:created (late binding: join
+# via the worker's amplifier "Session ID:" log line — binds within a tick or two)
+
 S4_ASSERTION_NAMES = [
     "supervisor-started",
     "workers-dispatched",
@@ -157,6 +160,11 @@ S4_ASSERTION_NAMES = [
     "events-worker-finished-x2-judged-false",
     "events-no-duplicates",
     "ledger-full-story",
+    # Bell assertions (muxplex Tier-3 surface) — appended so the original 16
+    # stay untouched; execution interleaves per the scenario doc's ordering note.
+    "bells-rung-both-workers",
+    "window-bell-flags",
+    "restart-no-duplicate-bells",
 ]
 
 # -- scenario 5 (cold triage) constants ------------------------------------------
@@ -730,6 +738,14 @@ def cmd_tmux_ls() -> str:
 
 def cmd_tmux_kill(session: str) -> str:
     return f"tmux kill-session -t ={session} 2>/dev/null; true"
+
+
+def cmd_tmux_bell_flag(session: str) -> str:
+    """The smoke-verified window_bell_flag query form (list-windows against the
+    session, first line). bells.py itself targets windows by `@id` from
+    #{window_id} — never `session:0`, base-index is user-configurable — but for
+    READING the flag, list-windows over the session is the documented form."""
+    return f"tmux list-windows -t ={session} -F '#{{window_bell_flag}}' 2>/dev/null | head -1"
 
 
 def cmd_ledger_cat(home: str) -> str:
@@ -1496,6 +1512,51 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
                 f"count={len(created)}, packet_ids={sorted(str(e.get('packet_id')) for e in created)}",
             )
 
+        # 5b. Bells (muxplex Tier-3 surface) — graded HERE, while the workers are
+        #     still alive/blocked (their tmux sessions die after answering). Join:
+        #     packet.source.session_id <-> the amplifier "Session ID:" line observe()
+        #     extracts from worker.log — late binding within a tick or two expected.
+        def poll_bells() -> list[dict[str, Any]] | None:
+            events_now, _ = _fetch_events(s, home)
+            rung = [e for e in _events_named(events_now, "bell:rung") if e.get("trigger") == "packet"]
+            return rung if len(rung) >= 2 else None
+
+        rung = _poll(s, S4_BELL_WAIT_S, poll_bells)
+        if rung is None:
+            events_now, _ = _fetch_events(s, home)
+            rung_now = [e for e in _events_named(events_now, "bell:rung") if e.get("trigger") == "packet"]
+            bell_errors = _events_named(events_now, "bell:error")
+            s.check(
+                "bells-rung-both-workers",
+                False,
+                f"expected 2 bell:rung (trigger=packet) within {S4_BELL_WAIT_S:.0f}s, saw {len(rung_now)} "
+                f"({[{k: e.get(k) for k in ('session', 'packet_id')} for e in rung_now]}); "
+                f"bell:error events: {[{k: e.get(k) for k in ('session', 'error')} for e in bell_errors]}",
+            )
+        else:
+            rung_sessions = sorted(str(e.get("session")) for e in rung)
+            rung_packet_ids = sorted(str(e.get("packet_id")) for e in rung)
+            s.check(
+                "bells-rung-both-workers",
+                len(rung) == 2
+                and set(rung_sessions) == {w["session"] for w in S4_WORKERS.values()}
+                and rung_packet_ids == packet_ids,
+                f"count={len(rung)}, sessions={rung_sessions}, packet_ids={rung_packet_ids} (created: {packet_ids})",
+            )
+
+        flag_states = {
+            str(w["session"]): s.ex.run(
+                cmd_tmux_bell_flag(str(w["session"])), label=f"bell-flag-{w['session']}"
+            ).stdout.strip()
+            for w in S4_WORKERS.values()
+        }
+        s.check(
+            "window-bell-flags",
+            all(flag == "1" for flag in flag_states.values()),
+            f"window_bell_flag per session: {flag_states} (query: list-windows -F '#{{window_bell_flag}}', "
+            "smoke-verified form; bells.py rings via @window-id + pane-tty BEL)",
+        )
+
         # 6. Notifications: HARD = every created packet id appears in well-formed
         #    batch records. SOFT (detail only) = ONE batch covered both.
         def poll_notify() -> tuple[list[dict[str, Any]], int] | None:
@@ -1550,6 +1611,7 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
             s.cne(
                 "restart-no-duplicate-events", "old supervisor survived the kill — restarting would run two supervisors"
             )
+            s.cne("restart-no-duplicate-bells", "old supervisor survived the kill — restart skipped")
         else:
             relaunch = s.ex.run(
                 cmd_supervise_launch(cfg, s.queue_dir, home, s.dtu_sdir, notify_path, sup_log, sup_pgid_file),
@@ -1558,6 +1620,7 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
             pid2 = _poll_pgid_file(s.ex, sup_pgid_file, "supervisor-pgid-read-2") if relaunch.rc == 0 else None
             if pid2 is None or pid2 == pid:
                 s.cne("restart-no-duplicate-events", f"supervisor relaunch failed: rc={relaunch.rc}, pgid {pid2!r}")
+                s.cne("restart-no-duplicate-bells", "supervisor relaunch failed")
             else:
                 sup_pids.append(pid2)
                 time.sleep(min(S4_RESTART_SETTLE_S, max(0.0, s.remaining())))
@@ -1568,6 +1631,16 @@ def run_scenario_4(cfg: Config) -> ScenarioResult:
                     len(created_after) == 2,
                     f"packet:created count after SIGKILL+restart+~2 ticks: {len(created_after)} "
                     f"(restart pgid {pid2}; malformed lines: {malformed_after})",
+                )
+                # Ring-once-across-restarts: rung_packets is persisted in state.json
+                # (D5), so the restarted supervisor must NOT re-ring — mirrors the
+                # packet:created no-dup assertion above, same events fetch.
+                rung_after = [e for e in _events_named(events_after, "bell:rung") if e.get("trigger") == "packet"]
+                s.check(
+                    "restart-no-duplicate-bells",
+                    len(rung_after) == 2,
+                    f"bell:rung (trigger=packet) count after SIGKILL+restart+~2 ticks: {len(rung_after)} "
+                    f"(rung_packets persisted in state.json — ring-once-across-restarts)",
                 )
 
         # 8. Map packets to workers (tag primary, keywords fallback).
@@ -2959,6 +3032,22 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
         ),
         (
             (
+                f"poll events.jsonl (<= {S4_BELL_WAIT_S:.0f}s) for 2 bell:rung (trigger=packet) covering BOTH "
+                "sessions with matching packet_ids (join via the worker's amplifier 'Session ID:' log line — "
+                "late binding within a tick or two expected)"
+            ),
+            cmd_cat(f"{home}/events.jsonl"),
+        ),
+        (
+            "grade window_bell_flag==1 on am-w1 (smoke-verified query form; checked while workers are alive)",
+            cmd_tmux_bell_flag("am-w1"),
+        ),
+        (
+            "grade window_bell_flag==1 on am-w2",
+            cmd_tmux_bell_flag("am-w2"),
+        ),
+        (
+            (
                 f"poll notify sink (<= {S4_NOTIFY_WAIT_S:.0f}s): every created packet id covered by well-formed "
                 "batch records (soft detail: ONE batch covering both)"
             ),
@@ -2977,7 +3066,11 @@ def _plan_scenario_4(cfg: Config, dtu_sdir: str, queue_dir: str) -> list[tuple[s
             cmd_supervise_launch(cfg, queue_dir, home, dtu_sdir, notify_path, sup_log, sup_pgid_file),
         ),
         (
-            f"wait ~2 ticks ({S4_RESTART_SETTLE_S:.0f}s), then assert packet:created count is STILL exactly 2 (D5)",
+            (
+                f"wait ~2 ticks ({S4_RESTART_SETTLE_S:.0f}s), then assert packet:created count is STILL exactly 2 "
+                "(D5) AND bell:rung (trigger=packet) count is STILL exactly 2 (rung_packets persisted — "
+                "ring-once-across-restarts)"
+            ),
             cmd_cat(f"{home}/events.jsonl"),
         ),
         (

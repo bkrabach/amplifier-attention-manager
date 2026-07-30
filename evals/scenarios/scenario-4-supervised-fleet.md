@@ -4,12 +4,14 @@
 in-DTU value over `scripts/local_supervisor_smoke.sh` (which uses fake
 queue-lib workers). Two `amplifier run` workers dispatched into `am-*` tmux
 sessions block on decisions; the supervisor observes the queue and the fleet,
-emits events, batches notifications, survives a mid-run SIGKILL+restart with
-no duplicate events (D5), and after CLI answers both workers unblock and the
-events + ledger tell the complete story.
+emits events, rings each worker's muxplex tmux bell (the Tier-3
+needs-attention surface), batches notifications, survives a mid-run
+SIGKILL+restart with no duplicate events OR duplicate bell rings (D5), and
+after CLI answers both workers unblock and the events + ledger tell the
+complete story.
 
-References: `docs/designs/attention-manager.md` §Tier 1 + build step 2,
-`src/attention_manager/{supervisor,workers,notify,state}.py`,
+References: `docs/designs/attention-manager.md` §Tier 1 + §Tier 3 + build
+step 2, `src/attention_manager/{supervisor,workers,notify,state,bells}.py`,
 `scripts/local_supervisor_smoke.sh` (the local judge this mirrors).
 
 ## Setup
@@ -44,13 +46,21 @@ References: `docs/designs/attention-manager.md` §Tier 1 + build step 2,
    mapping), print `DECISION RECEIVED: <answer>`, and finish.
 4. **Observe (poll 2s, generous budgets — two parallel LLM workers):**
    sessions exist → 2 `kind=decision` packets (≤240s) → exactly 2
-   `packet:created` in `$ATTENTION_HOME/events.jsonl` → notifications.
+   `packet:created` in `$ATTENTION_HOME/events.jsonl` → **bells** (≤30s: 2
+   `bell:rung` events with `trigger=="packet"` covering BOTH sessions, then
+   `window_bell_flag==1` on both — checked while the workers are still
+   alive/blocked; the packet↔worker join is via each worker's amplifier
+   `Session ID:` line extracted from worker.log, so late binding within a
+   tick or two is expected and fine) → notifications.
 5. **Durability mid-run:** SIGKILL the supervisor process group (pgid from
    `supervisor.pgid`); VERIFY it is dead (`kill -0`) — a surviving supervisor
    would run concurrently with the restart and duplicate events (hard FAIL,
    and the restart is skipped); restart with the same flags; wait ~2 ticks;
    `packet:created` count must STILL be exactly 2 (state.json is
-   authoritative on restart — no re-announce, D5). The supervisor itself
+   authoritative on restart — no re-announce, D5), AND `bell:rung`
+   (`trigger=="packet"`) count must STILL be exactly 2 (`rung_packets` is
+   persisted in state.json — ring-once-across-restarts, mirroring the
+   packet:created no-dup assertion). The supervisor itself
    enforces single-instance via an flock on `<home>/supervisor.lock` — a
    second live supervisor against the same home refuses to start.
 6. **Answer:** w1→A, w2→B via `attention-manager answer` (mapping via tag,
@@ -85,6 +95,14 @@ References: `docs/designs/attention-manager.md` §Tier 1 + build step 2,
 | 14 | `events-worker-finished-x2-judged-false` | exactly 2 `worker:finished`, covering BOTH sessions (`am-w1` AND `am-w2`), each `judged == false` and `exit_code == 0` |
 | 15 | `events-no-duplicates` | no `(event, packet_id)` pair appears more than once for `packet:created`/`packet:answered` — a duplicate is the signature of two supervisors writing one home |
 | 16 | `ledger-full-story` | ledger kinds: dispatched=2, packet_created=2, packet_answered=2, worker_finished=2, notified_batch>=1 |
+| 17 | `bells-rung-both-workers` | ≤30s after the packet:created assertion: exactly 2 `bell:rung` events with `trigger=="packet"`, sessions covering BOTH `am-w1` AND `am-w2`, packet_ids matching the two created packets (join via the worker's `Session ID:` log line — late binding expected) |
+| 18 | `window-bell-flags` | `window_bell_flag==1` on both sessions via `tmux list-windows -t '=<session>' -F '#{window_bell_flag}'` (the smoke-verified query form; bells.py targets windows by `@id` internally — never `session:0`, base-index is user-configurable). Checked while workers are alive (their sessions die after answering) |
+| 19 | `restart-no-duplicate-bells` | after SIGKILL + restart + ~2 ticks: `bell:rung` (`trigger=="packet"`) count is STILL exactly 2 — `rung_packets` persisted, ring-once-across-restarts |
+
+**Ordering note:** assertions 17/18 execute between #5 and #6 (bells must be
+graded while the workers still live), and #19 executes alongside #8 (same
+post-restart events fetch); they are numbered 17-19 here so the original
+1-16 stay untouched.
 
 ## The ONE-batch check (soft, honest)
 

@@ -131,6 +131,15 @@ class SupervisorState:
         self.seen_pending: set[str] = set()
         self.seen_answered: set[str] = set()
         self.workers: dict[str, dict[str, Any]] = {}  # keyed by tmux session name (am-*)
+        # Bell tracking (Tier-3 muxplex surface). Same seen-set discipline as
+        # the packet sets: persisted in state.json so a restart never re-rings
+        # (rung_packets) and never loses a not-yet-joined packet (ring_candidates
+        # maps packet_id -> source amplifier session_id awaiting its worker).
+        # On the no-snapshot rebuild path both start empty: pending packets are
+        # re-announced (see rebuild_seen_from_queue), so candidates are rebuilt
+        # naturally and a re-ring is the honest re-announce behavior.
+        self.rung_packets: set[str] = set()
+        self.ring_candidates: dict[str, str] = {}
         self.loaded_from_snapshot: bool = False
 
     # -- worker paths ---------------------------------------------------------
@@ -165,6 +174,9 @@ class SupervisorState:
         self.seen_pending = set(data.get("seen_pending", []))
         self.seen_answered = set(data.get("seen_answered", []))
         self.workers = dict(data.get("workers", {}))
+        # Additive fields (bells) — absent in pre-bells snapshots, default empty.
+        self.rung_packets = set(data.get("rung_packets", []))
+        self.ring_candidates = dict(data.get("ring_candidates", {}))
         self.loaded_from_snapshot = True
 
     def save(self) -> None:
@@ -175,6 +187,8 @@ class SupervisorState:
             "saved_at": utc_now_iso(),
             "seen_pending": sorted(self.seen_pending),
             "seen_answered": sorted(self.seen_answered),
+            "rung_packets": sorted(self.rung_packets),
+            "ring_candidates": self.ring_candidates,
             "workers": self.workers,
         }
         _write_atomic(self.state_path, json.dumps(data, indent=2) + "\n")
