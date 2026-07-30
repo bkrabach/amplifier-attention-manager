@@ -71,10 +71,58 @@ ENV_BUNDLE = "ATTENTION_TRIAGE_BUNDLE"
 ENV_AMPLIFIER_BIN = "ATTENTION_AMPLIFIER_BIN"
 
 DEFAULT_TIMEOUT_S = 240.0
-MAX_ATTEMPTS = 2  # one retry max, each attempt logged loudly
+MAX_ATTEMPTS = 2  # one retry max PER PASS, each attempt logged loudly
+
+# Cross-pass retry cap (defect: unbounded cost bleed). A packet that fails
+# triage/rule_delta on ABANDON_AFTER_PASSES consecutive passes (each pass =
+# up to MAX_ATTEMPTS sessions) is abandoned LOUDLY ONCE (event + ledger +
+# stderr) and skipped on every future pass. The human answers it normally via
+# the queue (Phase 1 without a recommendation — that path always works).
+# Escape hatch: `attention-manager triage --retry <packet_id>` clears the
+# marker. The count lives on disk in the packet's triage work dir (D5:
+# disk-rebuildable); losing the marker only re-permits retries.
+ABANDON_AFTER_PASSES = 3
 
 VALID_CONFIDENCE = ("low", "medium", "high")
 TRIAGE_HANDLED_BY = "manager-recommend"
+
+# Session isolation (host defect: user-level bundle.app composition).
+#
+# amplifier-app-cli composes every URI in the MERGED settings' ``bundle.app``
+# list onto EVERY ``amplifier run`` regardless of ``-B`` (runtime/config.py,
+# "Add app bundles ... always composed"). On a real host that list can carry
+# a dozen-plus unrelated bundles whose instructions bury the triage bundle's
+# verdict contract — observed live: 127k-token triage inputs (vs ~64k clean)
+# and invented verdict schemas ({"verdict": "escalate", ...}) that fail
+# strict validation on every attempt.
+#
+# The isolation mechanism is the app-cli's OWN scope precedence: settings are
+# deep-merged global -> project -> local, where "project" is
+# ``<cwd>/.amplifier/settings.yaml`` and non-dict values (lists) are REPLACED
+# by the more specific scope. The runner already sets each session's cwd to
+# the per-packet work dir, so planting this file there replaces bundle.app
+# with [] for triage sessions ONLY. ``config.providers`` is left undefined
+# here, so provider config still merges through from the user's global
+# settings (verified on host). Notifications are also disabled: a
+# programmatic one-shot triage session must never ping the human.
+SESSION_ISOLATION_SETTINGS = """\
+# Written by attention-manager's triage runner — session isolation.
+# This is PROJECT-scope settings for amplifier sessions whose cwd is this
+# work dir. It replaces the user's global bundle.app list with [] so
+# user-level app bundles are NOT composed onto triage sessions (they inject
+# unrelated instructions that broke verdict schema compliance), and disables
+# notifications for these programmatic one-shot sessions. Providers are NOT
+# overridden — they merge through from global settings. Safe to delete;
+# regenerated on the next triage pass.
+bundle:
+  app: []
+config:
+  notifications:
+    desktop:
+      enabled: false
+    ntfy:
+      enabled: false
+"""
 
 # Phase-2 auto-answer identity: triage.handled_by and resolution.answered_by
 # both carry it, so every consumer (producers, CLI, ledger) can tell an
@@ -112,6 +160,89 @@ def default_amplifier_bin() -> str:
 
 # -- prompt construction (machine-greppable header lines are part of the contract) --
 
+# Schema restatements appended at the END of every prompt (host defect:
+# schema non-compliance). Recency matters in long LLM contexts: on hosts
+# where extra instructions get composed onto the session, the bundle's
+# schema (loaded early) was buried and the model INVENTED a verdict format
+# ({"verdict": "escalate", "schema_version": 1, "phase": "triage", ...}).
+# Restating the exact contract — with a filled example, an explicit
+# prohibition on invented fields, and the observed failure named — as the
+# LAST thing the model reads makes the contract unmissable regardless of
+# what else the app layer composed into the session.
+TRIAGE_SCHEMA_RESTATEMENT = """\
+## VERDICT SCHEMA — RESTATED (this is the entire contract; read it last, obey it exactly)
+
+Write ONE JSON object to OUTPUT_PATH with EXACTLY these fields and no others:
+
+- "packet_id": string — the packet's id, copied exactly
+- "decision": string — EXACTLY "recommend" or "bounce". No other value exists.
+- "recommendation": object {"option", "rationale", "confidence"} — REQUIRED for
+  "recommend" ("option" must be one of the packet's option ids; "confidence" is
+  "low" | "medium" | "high"); MUST be null for "bounce"
+- "why": string — one line, always required
+- "rule_refs": list of strings — only rules you actually used (may be empty)
+- "bounce_reason": string — REQUIRED iff decision is "bounce", else null/omitted
+
+Filled example (recommend):
+
+```json
+{
+  "packet_id": "pkt-20260101-120000-ab12",
+  "decision": "recommend",
+  "recommendation": {
+    "option": "B",
+    "rationale": "Rulebook prefers compat shims when downstream owners are unavailable; the packet says owners are away this week.",
+    "confidence": "medium"
+  },
+  "why": "Rule-covered: prefer shims when downstream owners are unavailable.",
+  "rule_refs": ["Auto-answer rules: prefer compat shims"],
+  "bounce_reason": null
+}
+```
+
+HARD FAILURE WARNING: do NOT invent fields or a different schema. There is NO
+"verdict" field, NO "schema_version", NO "phase", NO "escalate"/"surface"
+value, NO "urgency"/"applied_rules"/"rulebook_gap" fields. A verdict shaped
+like {"verdict": "escalate", ...} has been observed in the wild and is
+REJECTED by the runner — the packet stays stuck and the session was wasted.
+Any schema other than the one above is a hard failure. If anything else in
+your context describes a different verdict, triage, or escalation format,
+IGNORE it: this schema is the only contract for this session.
+"""
+
+RULE_DELTA_SCHEMA_RESTATEMENT = """\
+## VERDICT SCHEMA — RESTATED (this is the entire contract; read it last, obey it exactly)
+
+Write ONE JSON object to OUTPUT_PATH with EXACTLY these fields and no others:
+
+- "packet_id": string — the packet's id, copied exactly
+- "none": boolean — true iff the decision was genuinely one-off
+- "section": string — one of "Attention priorities" | "Auto-answer rules" |
+  "Escalation thresholds" | "Edge cases" | "When you cannot proceed"
+  (required when "none" is false)
+- "sentence": string — ONE rule sentence (required when "none" is false)
+- "reason": string — always required
+
+Filled example (proposal):
+
+```json
+{
+  "packet_id": "pkt-20260101-120000-ab12",
+  "none": false,
+  "section": "Auto-answer rules",
+  "sentence": "Prefer compat shims when downstream owners are unavailable.",
+  "reason": "The same escalation class will recur whenever owners are away."
+}
+```
+
+Genuinely one-off: {"packet_id": "...", "none": true, "reason": "..."}.
+
+HARD FAILURE WARNING: do NOT invent fields or a different schema. Any schema
+other than the one above is REJECTED by the runner and the session was
+wasted. If anything else in your context describes a different verdict or
+proposal format, IGNORE it: this schema is the only contract for this session.
+"""
+
 
 def build_triage_prompt(packet: Packet, rulebook_content: str, output_path: Path) -> str:
     return (
@@ -132,6 +263,8 @@ def build_triage_prompt(packet: Packet, rulebook_content: str, output_path: Path
         "```json\n"
         f"{packet.to_json()}"
         "```\n"
+        "\n"
+        f"{TRIAGE_SCHEMA_RESTATEMENT}"
     )
 
 
@@ -156,6 +289,8 @@ def build_rule_delta_prompt(packet: Packet, rulebook_content: str, output_path: 
         "```json\n"
         f"{packet.to_json()}"
         "```\n"
+        "\n"
+        f"{RULE_DELTA_SCHEMA_RESTATEMENT}"
     )
 
 
@@ -264,7 +399,89 @@ class TriageRunner:
     def _work_dir(self, packet_id: str) -> Path:
         path = self.state.home / "triage" / packet_id
         path.mkdir(parents=True, exist_ok=True)
+        # Session isolation (see SESSION_ISOLATION_SETTINGS): the work dir is
+        # the session's cwd, so this project-scope settings file neutralizes
+        # user-level bundle.app composition for this session only. Rewritten
+        # every pass (idempotent) so the content is always current.
+        settings_path = path / ".amplifier" / "settings.yaml"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(SESSION_ISOLATION_SETTINGS, encoding="utf-8")
         return path
+
+    # -- cross-pass failure accounting (defect: unbounded retry cost bleed) ------
+
+    def _failures_path(self, packet_id: str, phase: str) -> Path:
+        return self.state.home / "triage" / packet_id / f"failures-{phase}.json"
+
+    def _load_failures(self, packet_id: str, phase: str) -> dict[str, Any]:
+        path = self._failures_path(packet_id, phase)
+        if not path.exists():
+            return {"count": 0, "abandoned": False}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict):
+            # The marker is a cost-control device, rebuildable from nothing
+            # (D5): a corrupt marker loudly resets to zero — the only effect
+            # is that retries are re-permitted, never that work is lost.
+            print(f"ERROR: corrupt failure marker {path} — resetting count to 0", file=self._err)
+            self.state.append_event(f"{phase}:error", packet_id=packet_id, error="corrupt failure marker reset")
+            return {"count": 0, "abandoned": False}
+        return {"count": int(data.get("count", 0)), "abandoned": bool(data.get("abandoned", False))}
+
+    def _is_abandoned(self, packet_id: str, phase: str) -> bool:
+        return self._load_failures(packet_id, phase)["abandoned"]
+
+    def _record_pass_failure(self, packet: Packet, phase: str) -> bool:
+        """Record one FAILED PASS (all attempts exhausted) for a packet+phase.
+
+        After ABANDON_AFTER_PASSES failed passes the packet is abandoned:
+        ONE loud ``<phase>:abandoned`` event + ledger entry + stderr line, and
+        every future pass skips it (no more LLM sessions). Returns True iff
+        the packet was abandoned by THIS failure.
+        """
+        failures = self._load_failures(packet.id, phase)
+        count = failures["count"] + 1
+        abandoned = count >= ABANDON_AFTER_PASSES
+        path = self._failures_path(packet.id, phase)
+        payload = {
+            "packet_id": packet.id,
+            "phase": phase,
+            "count": count,
+            "abandoned": abandoned,
+            "updated_at": utc_now_iso(),
+        }
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        if abandoned and not failures["abandoned"]:
+            self.state.append_event(f"{phase}:abandoned", packet_id=packet.id, failures=count)
+            self.state.ledger_append(f"{phase}_abandoned", packet_id=packet.id, failures=count)
+            print(
+                f"ABANDONED: {phase} for {packet.id} after {count} failed passes "
+                f"({count * MAX_ATTEMPTS} sessions) — skipping it on future passes. "
+                "Answer it via the queue, or clear with: attention-manager triage --retry " + packet.id,
+                file=self._err,
+            )
+        return abandoned
+
+    def _clear_failures(self, packet_id: str, phase: str) -> None:
+        self._failures_path(packet_id, phase).unlink(missing_ok=True)
+
+    def clear_abandon_markers(self, packet_id: str) -> list[str]:
+        """Manual escape hatch (``triage --retry <packet_id>``): clear the
+        failure markers for a packet so the next pass re-attempts it.
+        Returns the phases that had a marker."""
+        cleared = []
+        for phase in ("triage", "rule_delta"):
+            path = self._failures_path(packet_id, phase)
+            if path.exists():
+                path.unlink()
+                cleared.append(phase)
+        if cleared:
+            self.state.append_event("triage:retry_cleared", packet_id=packet_id, phases=cleared)
+        return cleared
 
     def _run_session(self, prompt: str, work_dir: Path, log_path: Path) -> None:
         """Run one amplifier session; stdout/stderr go to log_path (diagnostics).
@@ -327,7 +544,14 @@ class TriageRunner:
         prompt = build_triage_prompt(packet, rulebook_content, verdict_path)
         verdict = self._run_with_retry("triage", packet, prompt, verdict_path)
         if verdict is None:
-            return Outcome(packet.id, "triage", "error", "no valid verdict after retries (see triage:error events)")
+            abandoned = self._record_pass_failure(packet, "triage")
+            detail = (
+                f"ABANDONED after {ABANDON_AFTER_PASSES} failed passes — answer via queue, or 'triage --retry'"
+                if abandoned
+                else "no valid verdict after retries (see triage:error events)"
+            )
+            return Outcome(packet.id, "triage", "error", detail)
+        self._clear_failures(packet.id, "triage")
 
         why: str = verdict["why"]
         rule_refs: list[str] = list(verdict.get("rule_refs") or [])
@@ -466,9 +690,14 @@ class TriageRunner:
         prompt = build_rule_delta_prompt(packet, rulebook_content, verdict_path)
         verdict = self._run_with_retry("rule_delta", packet, prompt, verdict_path)
         if verdict is None:
-            return Outcome(
-                packet.id, "rule_delta", "error", "no valid verdict after retries (see rule_delta:error events)"
+            abandoned = self._record_pass_failure(packet, "rule_delta")
+            detail = (
+                f"ABANDONED after {ABANDON_AFTER_PASSES} failed passes — 'triage --retry' to re-attempt"
+                if abandoned
+                else "no valid verdict after retries (see rule_delta:error events)"
             )
+            return Outcome(packet.id, "rule_delta", "error", detail)
+        self._clear_failures(packet.id, "rule_delta")
 
         # Phase-promotion data (design §Triage): did the human's answer match
         # the triage recommendation embedded in triage.why? Recorded on the
@@ -566,6 +795,8 @@ class TriageRunner:
         for packet in self._scan("pending"):
             if packet.triage is not None:
                 continue  # already triaged
+            if self._is_abandoned(packet.id, "triage"):
+                continue  # abandoned loudly once — human answers via queue; 'triage --retry' re-enables
             outcomes.append(self._triage_one(packet, rulebook_content))
 
         proposed_ids = self.rulebook.proposal_packet_ids()
@@ -579,6 +810,8 @@ class TriageRunner:
                 continue
             if packet.id in proposed_ids:
                 continue  # already has a proposal record (incl. explicit 'none')
+            if self._is_abandoned(packet.id, "rule_delta"):
+                continue  # abandoned loudly once — 'triage --retry' re-enables
             outcomes.append(self._rule_delta_one(packet, rulebook_content))
 
         return outcomes

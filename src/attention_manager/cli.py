@@ -14,6 +14,7 @@ Commands:
                                 [--judge-timeout N] [--no-bells]
     attention-manager judge verify --cmd CMD --good PATH --broken PATH [--timeout N]
     attention-manager triage --once [--bundle URI] [--timeout N]
+    attention-manager triage --retry <packet_id>   # clear abandon/failure markers
     attention-manager auto list [--json]
     attention-manager auto confirm <packet_id>
     attention-manager auto reject <packet_id> --correct-option X --reason TEXT
@@ -166,6 +167,15 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
 
 def _cmd_triage(args: argparse.Namespace, as_json: bool) -> int:
     runner = TriageRunner(bundle_uri=args.bundle, timeout_s=args.timeout)
+    if args.retry:
+        # Escape hatch for abandoned packets: clear the cross-pass failure
+        # markers so the next pass re-attempts triage/rule_delta.
+        cleared = runner.clear_abandon_markers(args.retry)
+        if not cleared:
+            print(f"no failure markers found for {args.retry} (nothing to clear)", file=sys.stderr)
+            return 1
+        print(f"cleared {', '.join(cleared)} failure marker(s) for {args.retry} — next pass will re-attempt")
+        return 0
     runner.preflight()  # fail loud upfront if the amplifier binary is missing
     outcomes = runner.triage_pass()
     if as_json:
@@ -613,11 +623,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     triage_p = sub.add_parser("triage", help="run one cold-triage pass (Phase 1: recommend + bounce + rule deltas)")
-    triage_p.add_argument(
+    triage_mode = triage_p.add_mutually_exclusive_group(required=True)
+    triage_mode.add_argument(
         "--once",
         action="store_true",
-        required=True,
-        help="required: run exactly one pass (continuous triage runs inside 'supervise --triage')",
+        help="run exactly one pass (continuous triage runs inside 'supervise --triage')",
+    )
+    triage_mode.add_argument(
+        "--retry",
+        metavar="PACKET_ID",
+        default=None,
+        help="clear the abandon/failure markers for a packet so the next pass re-attempts it",
     )
     triage_p.add_argument(
         "--bundle", default=None, help="triage bundle URI ($ATTENTION_TRIAGE_BUNDLE, default: repo bundles/triage.md)"

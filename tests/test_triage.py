@@ -473,3 +473,157 @@ class TestSupervisorTriageWiring:
         supervisor.tick()  # must not raise
         errors = [e for e in supervisor.state.read_events() if e["event"] == "triage:error"]
         assert errors and "disk fell off" in errors[0]["error"]
+
+
+class TestSessionIsolation:
+    """Defect (host): user-level bundle.app composition broke verdict schema
+    compliance. The runner plants project-scope settings in the session cwd
+    (the per-packet work dir) that replace bundle.app with [] and disable
+    notifications — providers are NOT overridden, so they merge from global."""
+
+    def test_work_dir_writes_isolation_settings(self, runner):
+        packet = make_packet()
+        work_dir = runner._work_dir(packet.id)
+        settings = work_dir / ".amplifier" / "settings.yaml"
+        assert settings.exists()
+        content = settings.read_text(encoding="utf-8")
+        assert "app: []" in content  # user-level app bundles neutralized
+        assert "enabled: false" in content  # notifications off for programmatic sessions
+        assert "providers" not in content  # providers must merge through from global
+
+    def test_isolation_settings_present_after_real_pass(self, runner, monkeypatch):
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "recommend")
+        packet = make_packet()
+        runner.queue.write(packet)
+        runner.triage_pass()
+        settings = runner.state.home / "triage" / packet.id / ".amplifier" / "settings.yaml"
+        assert settings.exists()
+
+
+class TestSchemaRestatement:
+    """Defect (host): the triage LLM invented a verdict schema when composed
+    app bundles buried the contract. Both prompts now END with an exact
+    schema restatement + filled example + named observed failure."""
+
+    def test_triage_prompt_ends_with_schema_restatement(self, home):
+        packet = make_packet()
+        rulebook_content, _ = Rulebook(home=home).read()
+        prompt = build_triage_prompt(packet, rulebook_content, Path("/tmp/out.json"))
+        idx = prompt.index("VERDICT SCHEMA — RESTATED")
+        assert idx > prompt.index(packet.question)  # restatement comes AFTER the packet
+        tail = prompt[idx:]
+        assert '"decision": "recommend"' in tail  # filled example present
+        assert '{"verdict": "escalate"' in tail  # observed failure named
+        assert "hard failure" in tail
+        assert "IGNORE" in tail  # composed foreign instructions explicitly overridden
+
+    def test_rule_delta_prompt_ends_with_schema_restatement(self, home, queue_root):
+        queue = PacketQueue(queue_root)
+        packet = make_packet()
+        queue.write(packet)
+        answered = queue.answer(packet.id, "B", answered_by="human")
+        rulebook_content, _ = Rulebook(home=home).read()
+        prompt = build_rule_delta_prompt(answered, rulebook_content, Path("/tmp/rd.json"))
+        idx = prompt.index("VERDICT SCHEMA — RESTATED")
+        assert idx > prompt.index('"answered_by": "human"')
+        tail = prompt[idx:]
+        assert '"none": false' in tail  # filled example present
+        assert "hard failure" in tail.lower()
+
+
+class TestCrossPassAbandon:
+    """Defect: the one-retry cap was per PASS — a consistently-failing packet
+    re-cost 2 LLM sessions every pass forever. Now 3 failed passes abandon
+    the packet LOUDLY ONCE and skip it until 'triage --retry'."""
+
+    def _failing_packet(self, runner, monkeypatch) -> Packet:
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "missing")
+        packet = make_packet()
+        runner.queue.write(packet)
+        return packet
+
+    def test_three_failed_passes_abandon_loudly_once(self, runner, home, monkeypatch):
+        packet = self._failing_packet(runner, monkeypatch)
+
+        for expected_count in (1, 2):
+            outcomes = runner.triage_pass()
+            assert [(o.phase, o.outcome) for o in outcomes] == [("triage", "error")]
+            marker = json.loads(
+                (runner.state.home / "triage" / packet.id / "failures-triage.json").read_text(encoding="utf-8")
+            )
+            assert marker["count"] == expected_count
+            assert marker["abandoned"] is False
+        assert events_named(home, "triage:abandoned") == []
+
+        outcomes = runner.triage_pass()  # third failed pass -> abandon
+        assert len(outcomes) == 1 and "ABANDONED" in outcomes[0].detail
+        abandoned = events_named(home, "triage:abandoned")
+        assert len(abandoned) == 1
+        assert abandoned[0]["packet_id"] == packet.id
+        assert abandoned[0]["failures"] == 3
+        ledger = [e for e in runner.state.ledger_read() if e["kind"] == "triage_abandoned"]
+        assert len(ledger) == 1 and ledger[0]["packet_id"] == packet.id
+
+        # Fourth pass: SKIPPED — no outcome, no new sessions, no second event.
+        error_events_before = len(events_named(home, "triage:error"))
+        assert runner.triage_pass() == []
+        assert len(events_named(home, "triage:error")) == error_events_before
+        assert len(events_named(home, "triage:abandoned")) == 1
+
+        # The packet is untouched in pending/ — the human answers it normally.
+        assert runner.queue.get(packet.id).triage is None
+
+    def test_success_clears_failure_marker(self, runner, monkeypatch):
+        packet = self._failing_packet(runner, monkeypatch)
+        runner.triage_pass()  # one failed pass -> count 1
+        marker = runner.state.home / "triage" / packet.id / "failures-triage.json"
+        assert marker.exists()
+
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "recommend")
+        outcomes = runner.triage_pass()
+        assert [(o.phase, o.outcome) for o in outcomes] == [("triage", "recommended")]
+        assert not marker.exists()  # intermittent failures never accumulate to abandon
+
+    def test_corrupt_marker_resets_loudly(self, runner, home, monkeypatch):
+        packet = self._failing_packet(runner, monkeypatch)
+        work_dir = runner._work_dir(packet.id)
+        (work_dir / "failures-triage.json").write_text("{not json", encoding="utf-8")
+        assert runner._is_abandoned(packet.id, "triage") is False
+        errors = events_named(home, "triage:error")
+        assert errors and "corrupt failure marker" in errors[-1]["error"]
+
+    def test_rule_delta_abandon_path(self, runner, home, monkeypatch):
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "recommend")
+        monkeypatch.setenv("FAKE_DELTA_MODE", "missing")
+        packet = make_packet()
+        runner.queue.write(packet)
+        runner.triage_pass()  # recommend
+        runner.queue.answer(packet.id, "B", answered_by="human")
+
+        for _ in range(3):
+            runner.triage_pass()  # rule_delta fails each pass
+        abandoned = events_named(home, "rule_delta:abandoned")
+        assert len(abandoned) == 1 and abandoned[0]["failures"] == 3
+        assert runner.triage_pass() == []  # skipped from now on
+
+    def test_cli_retry_clears_markers_and_reenables(self, runner, home, queue_root, fake_amplifier, monkeypatch):
+        from attention_manager.cli import main
+
+        monkeypatch.setenv("ATTENTION_AMPLIFIER_BIN", str(fake_amplifier))
+        monkeypatch.setenv("ATTENTION_TRIAGE_BUNDLE", "test://triage-bundle")
+        packet = self._failing_packet(runner, monkeypatch)
+        for _ in range(3):
+            runner.triage_pass()
+        assert runner.triage_pass() == []  # abandoned
+
+        assert main(["triage", "--retry", packet.id]) == 0
+        assert not (runner.state.home / "triage" / packet.id / "failures-triage.json").exists()
+        monkeypatch.setenv("FAKE_TRIAGE_MODE", "recommend")
+        outcomes = runner.triage_pass()  # re-attempted and now succeeds
+        assert [(o.phase, o.outcome) for o in outcomes] == [("triage", "recommended")]
+
+    def test_cli_retry_unknown_packet_fails(self, home, capsys):
+        from attention_manager.cli import main
+
+        assert main(["triage", "--retry", "pkt-never-existed"]) == 1
+        assert "no failure markers" in capsys.readouterr().err

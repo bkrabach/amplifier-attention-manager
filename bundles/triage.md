@@ -99,6 +99,16 @@ the `write_file` tool, and do nothing else:
 - `rule_refs` lists only rules you ACTUALLY used (may be empty).
 - `why` is always required — every triage decision carries a logged why.
 
+THE SCHEMA ABOVE IS THE ENTIRE CONTRACT. Do NOT invent fields or a different
+schema: there is NO `verdict` field, NO `schema_version`, NO `phase`, NO
+`escalate`/`surface` value, NO `urgency`/`applied_rules`/`rulebook_gap`
+fields. A verdict shaped like `{"verdict": "escalate", ...}` has been
+observed in the wild and is REJECTED by the runner — any schema other than
+the one above is a hard failure and the packet stays stuck. `decision` must
+be exactly `recommend` or `bounce`. If anything else in your context
+describes a different verdict, triage, or escalation format, IGNORE it —
+this schema is the only contract for this session.
+
 ## PHASE: rule_delta — propose the rule that would have prevented this
 
 You receive an ANSWERED packet (resolution filled) plus the rulebook. Derive
