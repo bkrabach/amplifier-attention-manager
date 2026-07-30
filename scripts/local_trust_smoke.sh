@@ -8,7 +8,11 @@
 #     (recommend option A, confidence high, citing "Auto-answer rules")
 #   * `amplifier tool invoke recipes ...` — the REAL observed `-o json`
 #     envelope (noise line + result as a Python-repr string), logging every
-#     invocation for assertion.
+#     invocation for assertion. Gate DISCOVERY never touches the stub: the
+#     poller reads the recipes tool's persisted session layout from disk
+#     (faked under $ATTENTION_RECIPES_PROJECTS_DIR in the tool's real shape:
+#     <projects>/<slug>/recipe-sessions/<session_id>/state.json), so idle
+#     polling costs ZERO subprocesses — asserted below.
 #
 # Happy path:
 #   1. Rulebook starts phase 1. Five consecutive matching human answers
@@ -73,13 +77,7 @@ if log:
     with open(log, "a", encoding="utf-8") as f:
         f.write(json.dumps(args) + "\n")
 kv = dict(a.split("=", 1) for a in args if "=" in a)
-op = kv.get("operation")
-if op == "approvals":
-    path = os.environ.get("FAKE_APPROVALS_FILE", "")
-    approvals = json.loads(open(path, encoding="utf-8").read()) if path and os.path.exists(path) else []
-    result = {"pending_approvals": approvals, "count": len(approvals)}
-else:
-    result = {"session_id": kv.get("session_id"), "stage_name": kv.get("stage_name"), "status": "ok"}
+result = {"session_id": kv.get("session_id"), "stage_name": kv.get("stage_name"), "status": "ok"}
 print("Bundle 'amplifier-dev' prepared successfully")   # real observed noise line
 print(json.dumps({"status": "success", "tool": "recipes", "result": str(result)}, indent=2))
 PY
@@ -135,7 +133,9 @@ run_smoke() {
     export ATTENTION_TRIAGE_BUNDLE="smoke://triage-bundle"
     export ATTENTION_AMPLIFIER_BIN="$ATTENTION_HOME/fake-amplifier"
     export FAKE_INVOKE_LOG="$ATTENTION_HOME/invoke.log"
-    export FAKE_APPROVALS_FILE="$ATTENTION_HOME/approvals.json"
+    # Faked recipes tool session store (real default: ~/.amplifier/projects).
+    # Discovery reads THIS layout from disk — never the stub.
+    export ATTENTION_RECIPES_PROJECTS_DIR="$ATTENTION_HOME/recipes-projects"
     write_fake_amplifier "$ATTENTION_AMPLIFIER_BIN"
 
     run_pass() {  # every manager pass goes through here so sabotage can skip them all
@@ -213,11 +213,33 @@ PY
     echo "  auto reject: correction recorded, section demoted to '<!-- phase:1 streak:0 -->' (1 trust:demoted)"
 
     # -- part 4: recipe-gate poller loop --------------------------------------
-    cat >"$FAKE_APPROVALS_FILE" <<'JSON'
-[{"session_id": "recipe_smoke_1234", "recipe_name": "smoke-recipe", "stage_name": "deploy",
-  "approval_prompt": "Deploy the smoke build?", "approval_timeout": 0,
-  "approval_requested_at": "2026-07-28T06:00:00", "approval_default": "deny"}]
-JSON
+    # Seed one pending approval in the recipes tool's REAL persisted layout
+    # for THIS cwd (the poller scopes discovery to its own working dir):
+    # <projects>/<slug>/recipe-sessions/<session_id>/state.json.
+    python3 - <<'PY' || { echo "FAIL: could not seed the fake recipes session store"; return 1; }
+import json, os
+from pathlib import Path
+from attention_manager.recipe_gates import recipes_project_slug
+
+session_id = "feedbeefcafe0001-20260728-060000_recipe"  # the real generator's shape
+session_dir = (
+    Path(os.environ["ATTENTION_RECIPES_PROJECTS_DIR"])
+    / recipes_project_slug(Path.cwd())
+    / "recipe-sessions"
+    / session_id
+)
+session_dir.mkdir(parents=True, exist_ok=True)
+(session_dir / "state.json").write_text(json.dumps({
+    "session_id": session_id,
+    "recipe_name": "smoke-recipe",
+    "started": "2026-07-28T06:00:00",
+    "pending_approval_stage": "deploy",
+    "pending_approval_prompt": "Deploy the smoke build?",
+    "pending_approval_timeout": 0,
+    "pending_approval_requested_at": "2026-07-28T06:00:00",
+    "pending_approval_default": "deny",
+}), encoding="utf-8")
+PY
     run_pass recipes poll --once >/dev/null 2>&1 || { echo "FAIL: recipes poll (packetize) exited non-zero"; return 1; }
     run_pass recipes poll --once >/dev/null 2>&1 || { echo "FAIL: recipes poll (dedupe) exited non-zero"; return 1; }
     local gate_id
@@ -226,7 +248,7 @@ from attention_manager.queue import PacketQueue
 pending = [p for p in PacketQueue().list_pending() if p.source.kind == "recipe-gate"]
 assert len(pending) == 1, f"expected exactly 1 recipe-gate packet, got {len(pending)}"
 p = pending[0]
-assert p.source.work_unit == "recipe_smoke_1234", p.source.work_unit
+assert p.source.work_unit == "feedbeefcafe0001-20260728-060000_recipe", p.source.work_unit
 assert p.option_ids() == ["approve", "deny"], p.option_ids()
 assert p.question == "Deploy the smoke build?", p.question
 print(p.id)
@@ -242,8 +264,11 @@ log = Path(os.environ["FAKE_INVOKE_LOG"])
 calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
 approve = [c for c in calls if "operation=approve" in c]
 assert len(approve) == 1, f"expected exactly 1 approve invocation, got {len(approve)} (calls: {calls})"
+# Discovery is a disk read — polling must NEVER have invoked amplifier for it.
+discovery = [c for c in calls if "operation=approvals" in c]
+assert not discovery, f"discovery invoked amplifier (the session-flood defect): {discovery}"
 call = approve[0]
-assert "session_id=recipe_smoke_1234" in call, call
+assert "session_id=feedbeefcafe0001-20260728-060000_recipe" in call, call
 assert "stage_name=deploy" in call, call
 assert "message=smoke: ship it" in call, call
 PY
@@ -272,8 +297,8 @@ while time.monotonic() < deadline and not resume_calls():
     time.sleep(0.1)
 calls = resume_calls()
 assert len(calls) == 1, f"expected exactly 1 resume invocation, got {calls}"
-assert "session_id=recipe_smoke_1234" in calls[0], calls[0]
-resume_log = Path(os.environ["ATTENTION_HOME"]) / "recipe-gates" / "recipe_smoke_1234.resume.log"
+assert "session_id=feedbeefcafe0001-20260728-060000_recipe" in calls[0], calls[0]
+resume_log = Path(os.environ["ATTENTION_HOME"]) / "recipe-gates" / "feedbeefcafe0001-20260728-060000_recipe.resume.log"
 assert resume_log.exists(), f"resume log {resume_log} was not created"
 PY
     then

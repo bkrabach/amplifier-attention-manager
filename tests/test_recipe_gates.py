@@ -3,9 +3,16 @@ emits the REAL observed `amplifier tool invoke -o json` output shape (noise
 line + JSON envelope whose `result` field is the Python-repr STRING of the
 tool output) and records every invocation to a log file.
 
-Covers: strict output parsing, approvals → packet creation, dedupe across
-polls AND poller instances (disk-tracked), answer forwarding (approve with
-message / deny with reason), the loud error paths, and supervisor wiring.
+Gate DISCOVERY never touches the stub: it is a direct disk read of the
+recipes tool's persisted session layout (faked here in tmp, byte-shape
+verified against the real tool's SessionManager). The stub serves only the
+forwarding invokes (approve/deny/resume).
+
+Covers: strict output parsing, disk discovery (including the ZERO-subprocess
+idle guarantee — the production defect was 1,820 junk amplifier sessions
+from invoke-based discovery), packet creation, dedupe across polls AND
+poller instances (disk-tracked), answer forwarding (approve with message /
+deny with reason), the loud error paths, and supervisor wiring.
 """
 
 import json
@@ -18,13 +25,19 @@ import pytest
 
 from attention_manager.packet import Packet
 from attention_manager.queue import PacketQueue
-from attention_manager.recipe_gates import RecipeGateError, RecipeGatePoller, parse_invoke_output
+from attention_manager.recipe_gates import (
+    RecipeGateError,
+    RecipeGatePoller,
+    parse_invoke_output,
+    recipes_project_slug,
+)
 from attention_manager.state import SupervisorState
 
 # The fake amplifier CLI. Handles `tool invoke recipes <k=v...> -o json`:
-# appends the invocation args to $FAKE_INVOKE_LOG, then answers per operation.
-# Output mirrors the REAL observed shape: a non-JSON noise line, then a JSON
+# appends the invocation args to $FAKE_INVOKE_LOG, then answers. Output
+# mirrors the REAL observed shape: a non-JSON noise line, then a JSON
 # envelope whose "result" is str() of the tool's output dict (Python repr).
+# There is deliberately NO approvals handling — discovery must never invoke.
 FAKE_AMPLIFIER = r"""#!/usr/bin/env python3
 import json, os, sys
 
@@ -41,19 +54,15 @@ if op in fail_ops:
     print("simulated recipes tool failure", file=sys.stderr)
     sys.exit(1)
 
-if op == "approvals":
-    path = os.environ.get("FAKE_APPROVALS_FILE", "")
-    approvals = json.loads(open(path, encoding="utf-8").read()) if path and os.path.exists(path) else []
-    result = {"pending_approvals": approvals, "count": len(approvals)}
-else:
-    result = {"session_id": kv.get("session_id"), "stage_name": kv.get("stage_name"), "status": "ok"}
-
+result = {"session_id": kv.get("session_id"), "stage_name": kv.get("stage_name"), "status": "ok"}
 print("Bundle 'amplifier-dev' prepared successfully")
 print(json.dumps({"status": "success", "tool": "recipes", "result": str(result)}, indent=2))
 """
 
+# Session id in the REAL generator's shape: {16 hex}-{YYYYMMDD-HHMMSS}_recipe
+# (recipes tool session.py generate_session_id).
 APPROVAL = {
-    "session_id": "recipe_20260728_060000_ab12",
+    "session_id": "ab12cd34ef567890-20260728-060000_recipe",
     "recipe_name": "dependency-upgrade",
     "stage_name": "deploy",
     "approval_prompt": "Deploy the upgraded dependencies to staging?",
@@ -61,6 +70,46 @@ APPROVAL = {
     "approval_requested_at": "2026-07-28T06:00:00",
     "approval_default": "deny",
 }
+
+
+def seed_recipe_session(
+    projects_dir: Path,
+    project_dir: Path,
+    approval: dict = APPROVAL,
+    pending: bool = True,
+    raw: str | None = None,
+) -> Path:
+    """Write a state.json in the recipes tool's REAL persisted layout:
+    <projects>/<slug>/recipe-sessions/<session_id>/state.json (see
+    recipe_gates.py module docstring for the verified format). Returns the
+    state file path."""
+    session_dir = projects_dir / recipes_project_slug(project_dir) / "recipe-sessions" / approval["session_id"]
+    session_dir.mkdir(parents=True, exist_ok=True)
+    state_file = session_dir / "state.json"
+    if raw is not None:
+        state_file.write_text(raw, encoding="utf-8")
+        return state_file
+    state = {
+        "session_id": approval["session_id"],
+        "recipe_name": approval["recipe_name"],
+        "started": "2026-07-28T06:00:00",
+        "current_step_index": 0,
+        "completed_steps": [],
+        "project_path": str(project_dir.resolve()),
+    }
+    if pending:
+        state.update(
+            {
+                "pending_approval_stage": approval["stage_name"],
+                "pending_approval_prompt": approval["approval_prompt"],
+                "pending_approval_timeout": approval["approval_timeout"],
+                "pending_approval_requested_at": approval["approval_requested_at"],
+                "pending_approval_default": approval["approval_default"],
+                "stage_approvals": {approval["stage_name"]: "pending"},
+            }
+        )
+    state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return state_file
 
 
 @pytest.fixture
@@ -81,16 +130,32 @@ def fake_amplifier(tmp_path, monkeypatch) -> Path:
 
 
 @pytest.fixture
-def approvals_file(tmp_path, monkeypatch) -> Path:
-    path = tmp_path / "approvals.json"
-    path.write_text(json.dumps([APPROVAL]), encoding="utf-8")
-    monkeypatch.setenv("FAKE_APPROVALS_FILE", str(path))
+def project_dir(tmp_path) -> Path:
+    """The cwd the poller polls for — the recipes tool scopes sessions per-project."""
+    path = tmp_path / "project"
+    path.mkdir()
     return path
 
 
 @pytest.fixture
-def poller(home, queue_root, fake_amplifier, approvals_file) -> RecipeGatePoller:
-    return RecipeGatePoller(home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30)
+def recipes_projects_dir(tmp_path, monkeypatch) -> Path:
+    """Faked recipes tool session store base (real default: ~/.amplifier/projects)."""
+    path = tmp_path / "recipes-projects"
+    monkeypatch.setenv("ATTENTION_RECIPES_PROJECTS_DIR", str(path))
+    return path
+
+
+@pytest.fixture
+def pending_gate(recipes_projects_dir, project_dir) -> Path:
+    """One pending approval gate on disk; returns its state.json path."""
+    return seed_recipe_session(recipes_projects_dir, project_dir)
+
+
+@pytest.fixture
+def poller(home, queue_root, fake_amplifier, pending_gate, project_dir) -> RecipeGatePoller:
+    return RecipeGatePoller(
+        home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30, cwd=project_dir
+    )
 
 
 def invocations(tmp_path) -> list[list[str]]:
@@ -183,30 +248,134 @@ class TestPacketize:
         ledger = SupervisorState(home).ledger_read()
         assert any(e["kind"] == "recipe_gate_packetized" for e in ledger)
 
-    def test_dedupe_across_polls_and_restarts(self, poller, home, queue_root, fake_amplifier):
+    def test_dedupe_across_polls_and_restarts(self, poller, home, queue_root, fake_amplifier, project_dir):
         poller.poll_once()
         poller.poll_once()
         assert len(poller.queue.list_pending()) == 1  # same gate never packetized twice
 
         # A FRESH poller instance (restart) reads the disk-tracked state.
         fresh = RecipeGatePoller(
-            home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30
+            home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30, cwd=project_dir
         )
         fresh.poll_once()
         assert len(fresh.queue.list_pending()) == 1
 
-    def test_question_synthesized_when_prompt_empty(self, poller, approvals_file):
-        gate = dict(APPROVAL, approval_prompt="")
-        approvals_file.write_text(json.dumps([gate]), encoding="utf-8")
+    def test_question_synthesized_when_prompt_empty(self, poller, recipes_projects_dir, project_dir):
+        seed_recipe_session(recipes_projects_dir, project_dir, approval=dict(APPROVAL, approval_prompt=""))
         poller.poll_once()
         packet = poller.queue.list_pending()[0]
         assert "deploy" in packet.question and "dependency-upgrade" in packet.question
 
-    def test_malformed_approval_record_is_a_loud_error(self, poller, home, approvals_file):
-        approvals_file.write_text(json.dumps([{"nope": True}]), encoding="utf-8")
+    def test_malformed_approval_record_is_a_loud_error(self, poller, home, monkeypatch):
+        # Defense-in-depth: a record missing session_id/stage_name (format
+        # drift in the discovered state) is a loud error, never a bad packet.
+        monkeypatch.setattr(poller, "_pending_approvals_from_disk", lambda: [{"nope": True}])
         results = poller.poll_once()
         assert [r["action"] for r in results] == ["error"]
         assert events_named(home, "recipe_gates:error")
+
+
+# -- disk discovery (the fix for the session-flood defect) ----------------------------
+
+
+class TestDiskDiscovery:
+    def test_default_base_matches_the_shipped_bundle_config(self):
+        # behaviors/recipes.yaml in the shipped recipes bundle sets session_dir
+        # to this path with a LITERAL un-substituted {project} — host-verified
+        # by executing a real gate recipe and locating its state.json.
+        from attention_manager.recipe_gates import DEFAULT_RECIPES_PROJECTS_DIR
+
+        assert DEFAULT_RECIPES_PROJECTS_DIR == "~/.amplifier/projects/{project}/recipe-sessions"
+
+    def test_slug_matches_the_recipes_tool_format(self):
+        # Mirrors session.py get_project_slug: separators -> '-', leading '-' stripped.
+        assert recipes_project_slug(Path("/home/bkrabach/dev/better-attention")) == "home-bkrabach-dev-better-attention"
+
+    def test_idle_poll_makes_zero_subprocess_invocations(
+        self, home, queue_root, fake_amplifier, recipes_projects_dir, project_dir, tmp_path, monkeypatch
+    ):
+        # THE defect: invoke-based discovery created one amplifier session per
+        # poll (1,820 in 5.75h on the host). Idle polling must cost ZERO
+        # subprocesses — spy on BOTH spawn paths in the module.
+        from attention_manager import recipe_gates as rg
+
+        def no_subprocess(*args, **kwargs):
+            raise AssertionError(f"idle poll spawned a subprocess: {args!r}")
+
+        monkeypatch.setattr(rg.subprocess, "run", no_subprocess)
+        monkeypatch.setattr(rg.subprocess, "Popen", no_subprocess)
+        idle = RecipeGatePoller(
+            home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30, cwd=project_dir
+        )
+        assert idle.poll_once() == []
+        assert invocations(tmp_path) == []
+
+    def test_pending_gate_is_discovered_from_disk_without_any_invoke(self, poller, tmp_path, monkeypatch):
+        # Discovery of a REAL pending gate is also invoke-free: packetizing
+        # spawns nothing (only forwarding a human's answer invokes amplifier).
+        from attention_manager import recipe_gates as rg
+
+        def no_subprocess(*args, **kwargs):
+            raise AssertionError(f"discovery spawned a subprocess: {args!r}")
+
+        monkeypatch.setattr(rg.subprocess, "run", no_subprocess)
+        monkeypatch.setattr(rg.subprocess, "Popen", no_subprocess)
+        results = poller.poll_once()
+        assert [r["action"] for r in results] == ["packetized"]
+        assert len(poller.queue.list_pending()) == 1
+        assert invocations(tmp_path) == []
+
+    def test_session_without_pending_approval_is_not_packetized(
+        self, home, queue_root, fake_amplifier, recipes_projects_dir, project_dir
+    ):
+        seed_recipe_session(recipes_projects_dir, project_dir, pending=False)
+        poller = RecipeGatePoller(
+            home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30, cwd=project_dir
+        )
+        assert poller.poll_once() == []
+        assert poller.queue.list_pending() == []
+
+    def test_other_projects_sessions_are_out_of_scope(
+        self, home, queue_root, fake_amplifier, recipes_projects_dir, project_dir, tmp_path
+    ):
+        # The recipes tool scopes sessions per-project (working dir); the
+        # poller must read the scope for ITS cwd only.
+        other_project = tmp_path / "other-project"
+        other_project.mkdir()
+        seed_recipe_session(recipes_projects_dir, other_project)
+        poller = RecipeGatePoller(
+            home=home, queue=PacketQueue(queue_root), amplifier_bin=str(fake_amplifier), timeout_s=30, cwd=project_dir
+        )
+        assert poller.poll_once() == []
+
+    def test_corrupt_state_json_is_loud_skipped_and_reported_once(
+        self, poller, home, recipes_projects_dir, project_dir
+    ):
+        # The tool writes state.json NON-atomically — a torn read must not
+        # kill the poll (the valid gate still packetizes), must be loud
+        # (recipe_gates:error phase=disk_scan), and must not spam (once per
+        # file per poller instance).
+        other = dict(APPROVAL, session_id="ffffffffffffffff-20260728-070000_recipe")
+        seed_recipe_session(recipes_projects_dir, project_dir, approval=other, raw='{"torn writ')
+
+        results = poller.poll_once()
+        assert [r["action"] for r in results] == ["packetized"]  # the valid gate landed
+        errors = [e for e in events_named(home, "recipe_gates:error") if e.get("phase") == "disk_scan"]
+        assert len(errors) == 1 and other["session_id"] in errors[0]["file"]
+
+        poller.poll_once()  # same corrupt file: no new event from this instance
+        errors = [e for e in events_named(home, "recipe_gates:error") if e.get("phase") == "disk_scan"]
+        assert len(errors) == 1
+
+    def test_torn_write_self_heals_next_poll(self, poller, home, recipes_projects_dir, project_dir):
+        other = dict(APPROVAL, session_id="ffffffffffffffff-20260728-070000_recipe")
+        seed_recipe_session(recipes_projects_dir, project_dir, approval=other, raw='{"torn writ')
+        poller.poll_once()
+        assert len(poller.queue.list_pending()) == 1  # only the valid gate so far
+
+        seed_recipe_session(recipes_projects_dir, project_dir, approval=other)  # the write completes
+        poller.poll_once()
+        assert len(poller.queue.list_pending()) == 2  # recovered without intervention
 
 
 # -- forwarding answers back to the recipes tool --------------------------------------
@@ -264,14 +433,17 @@ class TestForwardAnswers:
         poller.poll_once()
         assert len([c for c in invocations(tmp_path) if "operation=approve" in c]) == attempts_before
 
-    def test_approvals_failure_does_not_block_forwarding(self, poller, home, tmp_path, monkeypatch):
+    def test_discovery_failure_does_not_block_forwarding(self, poller, home, tmp_path, monkeypatch):
         poller.poll_once()
         packet_id = poller.queue.list_pending()[0].id
         poller.queue.answer(packet_id, "approve")
 
-        monkeypatch.setenv("FAKE_FAIL_OPS", "approvals")
+        def boom():
+            raise RecipeGateError("disk discovery exploded")
+
+        monkeypatch.setattr(poller, "_pending_approvals_from_disk", boom)
         results = poller.poll_once()
-        assert any(r["action"] == "error" and r.get("phase") == "approvals" for r in results)
+        assert any(r["action"] == "error" and r.get("phase") == "discovery" for r in results)
         assert any(r["action"] == "resolved" for r in results)  # forwarding still ran
 
 
@@ -427,10 +599,13 @@ class TestWiring:
 
 
 class TestCli:
-    def test_recipes_poll_once_via_cli(self, home, queue_root, fake_amplifier, approvals_file, monkeypatch, capsys):
+    def test_recipes_poll_once_via_cli(
+        self, home, queue_root, fake_amplifier, pending_gate, project_dir, monkeypatch, capsys
+    ):
         from attention_manager.cli import main
 
         monkeypatch.setenv("ATTENTION_AMPLIFIER_BIN", str(fake_amplifier))
+        monkeypatch.chdir(project_dir)  # the CLI poller scopes discovery to its cwd
         assert main(["recipes", "poll", "--once"]) == 0
         out = capsys.readouterr().out
         assert "packetized" in out

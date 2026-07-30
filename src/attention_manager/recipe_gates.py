@@ -1,11 +1,12 @@
 """Recipe-gate poller — producer #4 of the escalation bus (design D9).
 
-Recipes' staged approval gates are bridged by an EXTERNAL ADAPTER: the poller
-shells out to the installed ``amplifier`` CLI's tool-invoke path (never patches
-the recipes tool), same rationale family as D8 (stdlib-only root package,
-reuse the environment's amplifier install, all state on disk):
+Recipes' staged approval gates are bridged by an EXTERNAL ADAPTER (never
+patches the recipes tool), same rationale family as D8 (stdlib-only root
+package, reuse the environment's amplifier install, all state on disk):
 
-* discover gates:  ``amplifier tool invoke recipes operation=approvals -o json``
+* discover gates:  DIRECT DISK READ of the recipes tool's persisted session
+  state (observation-only — this poller never writes those files). See
+  "Discovery: the recipes tool's storage layout" below.
 * answer gates:    ``amplifier tool invoke recipes operation=approve
   session_id=... stage_name=... message=...`` (or ``operation=deny`` with
   ``reason=...``)
@@ -17,7 +18,57 @@ reuse the environment's amplifier install, all state on disk):
   holds. Deny needs no resume — the recipe stops at the gate per the tool's
   semantics.
 
-Observed output shape (verified against the real CLI on this machine):
+COST MODEL (why discovery is a disk read, not a tool invoke): every
+``amplifier tool invoke`` prepares a full bundle and creates ONE amplifier
+session in the invoking project's session store
+(``~/.amplifier/projects/<slug>/sessions/``) even for pure tool code with no
+LLM. Dogfooding measured the damage: ``supervise --recipes`` at the old
+defaults (~1 poll / 10s) created 1,820 junk sessions in 5.75 hours, polluted
+session-list/resume, fed 1,820 no-op sessions to the context-intelligence
+hook, and the invoke itself repeatedly hit its 120s timeout. Discovery via
+``operation=approvals`` bought ZERO authority for that price — the tool's
+approvals op is itself a pure read of the same on-disk state this poller now
+reads directly. Invokes remain only for approve/deny/resume: rare,
+human-triggered, and worth a real session. Idle polling costs zero
+subprocesses.
+
+Discovery: the recipes tool's storage layout (verified against the installed
+tool source, amplifier-bundle-recipes ``modules/tool-recipes/
+amplifier_module_tool_recipes/`` — ``__init__.py`` mount()/_get_working_dir,
+``session.py`` SessionManager):
+
+* base dir:   the tool's ``session_dir`` config. Code default is
+  ``~/.amplifier/projects``, but the SHIPPED recipes bundle
+  (behaviors/recipes.yaml) sets ``~/.amplifier/projects/{project}/
+  recipe-sessions`` with a LITERAL un-substituted ``{project}`` — the real
+  base on any standard install (host-verified; see
+  ``DEFAULT_RECIPES_PROJECTS_DIR``).
+* scope:      per-project — the tool slugs the invoking session's working
+  dir: absolute path with ``/`` and ``\\`` replaced by ``-``, leading ``-``
+  stripped (session.py get_project_slug). NOTE this differs from the
+  amplifier CLI's own project slug, which KEEPS the leading dash.
+* sessions:   ``<base>/<slug>/recipe-sessions/<session_id>/state.json``
+  where session ids look like ``<16 hex>-<YYYYMMDD-HHMMSS>_recipe``
+* pending:    a session has a pending approval gate iff its ``state.json``
+  has a non-empty ``pending_approval_stage``; the sibling
+  ``pending_approval_prompt`` / ``pending_approval_timeout`` /
+  ``pending_approval_requested_at`` / ``pending_approval_default`` +
+  ``recipe_name`` / ``session_id`` keys are exactly the fields the tool's
+  ``approvals`` operation returns (session.py get_pending_approval) — the
+  disk IS the authority; there is no live-process state and the approvals
+  op applies no extra logic (not even timeout defaults).
+* caveat:     the tool writes ``state.json`` NON-atomically (plain open+dump),
+  so a reader can catch a torn write. A state.json that fails to parse is
+  reported LOUD (``recipe_gates:error`` phase=disk_scan, once per file per
+  poller instance to avoid event spam) and retried naturally next poll.
+
+The poller reads the scope for ITS OWN ``cwd`` (the same cwd it passes to
+forwarding invokes), so discovery and forwarding always agree on the project.
+Base dir is overridable via ``$ATTENTION_RECIPES_PROJECTS_DIR`` (tests/smoke
+point it at a faked layout; the real default matches the tool's default).
+
+Observed output shape for the REMAINING invokes (verified against the real
+CLI on this machine):
 
     Bundle 'amplifier-dev' prepared successfully
     {
@@ -64,6 +115,15 @@ DEFAULT_TIMEOUT_S = 120.0
 MAX_INVOKE_ATTEMPTS = 2  # one retry max on answer forwarding, each logged loudly
 
 ENV_RECIPES_BUNDLE = "ATTENTION_RECIPES_BUNDLE"
+ENV_RECIPES_PROJECTS_DIR = "ATTENTION_RECIPES_PROJECTS_DIR"
+# The recipes tool's session store base. The tool's CODE default is
+# ~/.amplifier/projects, but the SHIPPED recipes bundle overrides it:
+# behaviors/recipes.yaml sets `session_dir: ~/.amplifier/projects/{project}/
+# recipe-sessions` where `{project}` is a LITERAL directory name (no
+# substitution happens) — host-verified by executing a real gate recipe and
+# finding its state.json under this base. Non-standard mounts override via
+# $ATTENTION_RECIPES_PROJECTS_DIR.
+DEFAULT_RECIPES_PROJECTS_DIR = "~/.amplifier/projects/{project}/recipe-sessions"
 
 
 class RecipeGateError(ValueError):
@@ -107,6 +167,17 @@ def gate_key(session_id: str, stage_name: str) -> str:
     return f"{session_id}::{stage_name}"
 
 
+def recipes_project_slug(project_path: Path) -> str:
+    """The recipes tool's project slug for ``project_path``.
+
+    Mirrors the tool's ``get_project_slug`` (session.py): absolute path with
+    path separators replaced by ``-`` and ONE leading ``-`` stripped. This is
+    NOT the amplifier CLI's own project slug (which keeps the leading dash).
+    """
+    slug = str(project_path.resolve()).replace("/", "-").replace("\\", "-")
+    return slug.removeprefix("-")
+
+
 class RecipeGatePoller:
     """Polls recipes approval gates into packets, forwards answers back."""
 
@@ -119,6 +190,7 @@ class RecipeGatePoller:
         bundle: str | None = None,
         cwd: str | Path | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        projects_dir: str | Path | None = None,
         err: TextIO | None = None,
     ):
         # Same single-writer discipline as the triage runner: append-only
@@ -129,11 +201,19 @@ class RecipeGatePoller:
         self.amplifier_bin = amplifier_bin or default_amplifier_bin()
         self.bundle = bundle if bundle is not None else os.environ.get(ENV_RECIPES_BUNDLE)
         # Recipe sessions are project-scoped inside the recipes tool (working
-        # dir determines the project); invoke from a stable, explicit cwd.
+        # dir determines the project); discovery reads and forwarding invokes
+        # both use this cwd so they always agree on the project.
         self.cwd = Path(cwd).expanduser() if cwd is not None else Path.cwd()
         self.timeout_s = timeout_s
+        # The recipes tool's session store base dir (observation-only).
+        self.projects_dir = Path(
+            projects_dir or os.environ.get(ENV_RECIPES_PROJECTS_DIR) or DEFAULT_RECIPES_PROJECTS_DIR
+        ).expanduser()
         self._err = err or sys.stderr
         self.gates_path = self.state.home / STATE_FILENAME
+        # Torn/corrupt state.json reports: once per file per poller instance
+        # (same precedent as Supervisor._reported_bad_files) — loud, not spammy.
+        self._reported_bad_state_files: set[str] = set()
 
     # -- disk-tracked gate state (idempotent across restarts, D5) ---------------
 
@@ -190,6 +270,68 @@ class RecipeGatePoller:
             )
         return parse_invoke_output(proc.stdout)
 
+    # -- discovery: direct disk read of the recipes tool's session store ----------
+
+    def recipes_sessions_dir(self) -> Path:
+        """The recipes tool's session dir for this poller's cwd (see module docstring)."""
+        return self.projects_dir / recipes_project_slug(self.cwd) / "recipe-sessions"
+
+    def _report_bad_state_file(self, state_file: Path, error: Exception) -> None:
+        """Loud (event + stderr), once per file per poller instance.
+
+        Not fatal: the recipes tool writes state.json non-atomically, so a
+        torn read is EXPECTED under concurrency and self-heals next poll. A
+        permanently corrupt file keeps being skipped but was reported loudly.
+        """
+        key = str(state_file)
+        if key in self._reported_bad_state_files:
+            return
+        self._reported_bad_state_files.add(key)
+        message = f"unreadable recipe session state {state_file}: {error} — skipped this poll, will retry next poll"
+        self.state.append_event("recipe_gates:error", phase="disk_scan", file=key, error=str(error))
+        print(f"ERROR: {message}", file=self._err)
+
+    def _pending_approvals_from_disk(self) -> list[dict[str, Any]]:
+        """Read pending approval gates straight from the recipes tool's state files.
+
+        Observation-only (D9: external adapter — never writes the tool's
+        files). Mirrors the tool's own ``approvals`` operation field-for-field
+        (SessionManager.list_pending_approvals / get_pending_approval): a
+        session is pending iff its state.json has a non-empty
+        ``pending_approval_stage``. Zero subprocesses — this is what makes
+        idle polling free (see COST MODEL in the module docstring).
+        """
+        sessions_dir = self.recipes_sessions_dir()
+        if not sessions_dir.is_dir():
+            return []
+        approvals: list[dict[str, Any]] = []
+        for session_dir in sorted(sessions_dir.iterdir()):
+            state_file = session_dir / "state.json"
+            if not session_dir.is_dir() or not state_file.exists():
+                continue
+            try:
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:  # OSError: unreadable; ValueError: torn/corrupt JSON
+                self._report_bad_state_file(state_file, e)
+                continue
+            if not isinstance(state, dict):
+                self._report_bad_state_file(state_file, TypeError(f"state is {type(state).__name__}, expected object"))
+                continue
+            if not state.get("pending_approval_stage"):
+                continue  # no gate pending (running, completed, or already answered)
+            approvals.append(
+                {
+                    "session_id": state.get("session_id") or session_dir.name,
+                    "recipe_name": state.get("recipe_name", "unknown"),
+                    "stage_name": state["pending_approval_stage"],
+                    "approval_prompt": state.get("pending_approval_prompt", ""),
+                    "approval_timeout": state.get("pending_approval_timeout", 0),
+                    "approval_requested_at": state.get("pending_approval_requested_at"),
+                    "approval_default": state.get("pending_approval_default", "deny"),
+                }
+            )
+        return approvals
+
     # -- packetizing pending gates -----------------------------------------------
 
     def _packetize(self, approval: dict[str, Any]) -> Packet:
@@ -227,10 +369,7 @@ class RecipeGatePoller:
         )
 
     def _packetize_new_gates(self, gates: dict[str, dict[str, Any]], results: list[dict[str, Any]]) -> None:
-        payload = self._invoke(["operation=approvals"])
-        approvals = payload.get("pending_approvals")
-        if not isinstance(approvals, list):
-            raise RecipeGateError(f"approvals payload missing 'pending_approvals' list: {payload!r}")
+        approvals = self._pending_approvals_from_disk()
         for approval in approvals:
             if not isinstance(approval, dict) or not approval.get("session_id") or not approval.get("stage_name"):
                 raise RecipeGateError(f"malformed pending approval record: {approval!r}")
@@ -424,9 +563,11 @@ class RecipeGatePoller:
     def poll_once(self) -> list[dict[str, Any]]:
         """One full poll: packetize new pending gates, forward answered ones.
 
-        Discovery failure (approvals invoke) is loud but non-fatal to the
-        forwarding half — answered gates are still forwarded even when the
-        recipes tool cannot list approvals this tick.
+        Discovery is a direct disk read (zero subprocesses — see COST MODEL
+        in the module docstring); amplifier is invoked only to forward
+        answers (approve/deny) and launch resume. Discovery failure is loud
+        but non-fatal to the forwarding half — answered gates are still
+        forwarded even when the recipes tool's state cannot be read this tick.
         """
         results: list[dict[str, Any]] = []
         gates = self._load_gates()
@@ -434,9 +575,9 @@ class RecipeGatePoller:
         try:
             self._packetize_new_gates(gates, results)
         except RecipeGateError as e:
-            self.state.append_event("recipe_gates:error", error=str(e), phase="approvals")
-            print(f"ERROR: recipes approvals poll failed: {e}", file=self._err)
-            results.append({"action": "error", "phase": "approvals", "error": str(e)})
+            self.state.append_event("recipe_gates:error", error=str(e), phase="discovery")
+            print(f"ERROR: recipe-gate discovery failed: {e}", file=self._err)
+            results.append({"action": "error", "phase": "discovery", "error": str(e)})
 
         for key, gate in sorted(gates.items()):
             if gate.get("status") != "pending":

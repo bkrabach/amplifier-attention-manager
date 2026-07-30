@@ -92,5 +92,14 @@ it is in the ledger and queue files.
   by default (fetched via git); air-gapped hosts need `--triage-bundle`.
 - Recipe-gate polling (`--recipes`) needs the `recipes` tool available in the
   `amplifier` environment it shells out to.
+- **Every `amplifier tool invoke` costs one amplifier session** in the invoking
+  project's session store (`~/.amplifier/projects/<slug>/sessions/`) — bundle
+  prep + session creation happen even for pure tool code with no LLM. That is
+  why recipe-gate DISCOVERY never invokes amplifier: the poller reads the
+  recipes tool's persisted state from disk (observation-only) and idle polling
+  costs zero subprocesses. Invokes happen only to forward a human's
+  approve/deny and launch resume. (Pre-fix, invoke-based discovery at
+  ~1 poll/10s created 1,820 junk sessions in 5.75 hours.) The default poll
+  cadence is one per 30 ticks (60s at `--interval 2`) as defense-in-depth.
 - A worker turn that dies mid-escalation is not durable — the packet is, and
   the worker is re-driven via the packet's `links.resume`.

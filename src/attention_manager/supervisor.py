@@ -60,7 +60,11 @@ from .workers import Observation
 
 DEFAULT_INTERVAL_S = 2.0
 DEFAULT_TRIAGE_EVERY_TICKS = 15
-DEFAULT_RECIPES_EVERY_TICKS = 5
+# 30 ticks × 2s = one recipe-gate poll per minute. Discovery is a pure disk
+# read (zero subprocesses when idle — see recipe_gates.py COST MODEL), so this
+# is defense-in-depth, not the primary cost control: the old 5-tick default
+# with invoke-based discovery created 1,820 junk amplifier sessions in 5.75h.
+DEFAULT_RECIPES_EVERY_TICKS = 30
 LOCK_FILENAME = "supervisor.lock"
 
 
