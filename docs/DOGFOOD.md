@@ -108,7 +108,7 @@ attention-manager dispatch portfix \
   the judge runs" above — so a `"$WORKER_LOG"` judge like the dispatch
   example needs no `$ARTIFACT`.)
 
-## Making workers escalate (the NEEDS-HUMAN-DECISION protocol)
+## Making workers escalate (marked tasks AND self-identified decision points)
 
 Workers don't escalate by themselves — two pieces make it happen:
 
@@ -118,10 +118,20 @@ Workers don't escalate by themselves — two pieces make it happen:
    will just block or improvise instead of writing a packet.
    `bundles/test-worker.md` in this repo is the minimal working example.
 2. **The worker's instructions tell it when to call `request_decision`.**
-   The test-worker pattern: when a task contains a `NEEDS-HUMAN-DECISION`
-   marker with enumerated options, the worker MUST call `request_decision`
-   with those exact options plus its recommendation, block until the packet
-   is answered, then proceed per the answer — never inventing an answer.
+   Two paths, both required in the bundle body:
+   - **Marked tasks (mandatory path):** when a task contains a
+     `NEEDS-HUMAN-DECISION` marker with enumerated options, the worker MUST
+     call `request_decision` with those exact options plus its
+     recommendation, block until the packet is answered, then proceed per
+     the answer — never inventing an answer.
+   - **Self-identified decision points (unattended rule):** a dispatched
+     worker runs with nobody reading its output. If it reaches a decision,
+     preference, or approval point the task did NOT mark, it must still
+     call `request_decision` with its concrete options and recommendation —
+     never ask in conversational output. Without this rule, a worker
+     composes a perfectly packet-shaped answer ("option A or B? I recommend
+     A — which would you prefer?") and delivers it to an absent user, then
+     exits clean: the decision is lost and nothing rings.
 
 Task-prompt pattern (from `bundles/test-worker.md`):
 

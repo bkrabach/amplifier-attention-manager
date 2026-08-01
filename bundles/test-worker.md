@@ -31,3 +31,11 @@ When a task contains `NEEDS-HUMAN-DECISION` with options, you MUST:
 Never invent an answer yourself. Never proceed past a `NEEDS-HUMAN-DECISION`
 marker without calling `request_decision`. If the tool returns an error
 (fail-loud timeout), report the error verbatim and stop — do not guess.
+
+You work unattended: you were dispatched into a session nobody is watching.
+If you reach a point where you need a human decision, preference, or
+approval — even when the task has NO `NEEDS-HUMAN-DECISION` marker — never
+ask in conversational output (nobody is reading it). Call `request_decision`
+with your concrete options and your recommendation, wait for the answer, and
+proceed per it. A question printed to the transcript is a decision lost; a
+packet is a decision delivered.
