@@ -1,91 +1,85 @@
-// This repository packages the Attention Manager: an assistant that watches ongoing work, decides the rare moments a human decision is actually required, asks that one question, and records the answer so the same question answers itself next time.
+// attention-manager — an Amplifier bundle that watches long-running work,
+// notices when a human decision is actually needed, and escalates it as a
+// small "packet" a person can answer, instead of letting the work stall silently.
+
 digraph attention_manager {
     rankdir=LR
     fontname="Helvetica"
     fontsize=12
-    label="Attention Manager v0.1.0\nKnows when work needs a human — asks once, then remembers the answer"
+    label="Attention Manager v0.1.0\nKnows when to interrupt a human — turns stalled work into answerable decision packets"
     labelloc=t
     labeljust=c
     nodesep=0.6
     ranksep=0.7
     bgcolor="white"
-    source_hash="bedd84018daa4f3f47904539ae9147dd490ae441a751e3d8a068142d81a5b0c3"
+    source_hash="c19e9411fa1dc4064ecf70948cc8f2db1b259a15d821da1c7c435e58b81fbe43"
 
     node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
     edge [fontname="Helvetica", fontsize=9]
 
-    root_attention_manager [label="Attention Manager v0.1.0 — main package\n0 tools · 0 agents\n~402 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+    root_attention_manager [label="Attention Manager (main entry point)\nv0.1.0 · 0 tools · 0 agents\n~402 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
 
     subgraph cluster_behaviors {
-        label="Behaviors — Reusable Capability Packs"
+        label="Behaviors — reusable skill packs added to a session"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        beh_attention_manager_behavior [label="Core Rules For What Deserves Attention\n1 tools · 1 ctx\n~631 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
-        beh_packet_escalation [label="Ask A Human, Then Wait For The Answer\n2 tools\n~304 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+        beh_attention_manager_behavior [label="Core Attention Behavior\nTeaches the assistant when work needs a human\n1 tools · 1 ctx · ~631 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+        beh_packet_escalation [label="Decision Escalation\nRaises a blocked question to a person and waits\n2 tools · ~304 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
     }
 
     subgraph cluster_standalones {
-        label="Standalone Bundles — Ready-To-Run Assistants"
+        label="Ready-to-Run Bundles — complete configurations you can start directly"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        sta_attention_test_worker [label="Practice Worker\n(does test jobs safely)", shape=box, fillcolor="#80cbc4", style="filled,rounded"]
-        sta_attention_triage [label="Sorting Assistant\n(reviews the waiting queue)", shape=box, fillcolor="#80cbc4", style="filled,rounded"]
-    }
-
-    subgraph cluster_agents {
-        label="Agents — Specialist Helpers"
-        style="filled"
-        fillcolor="#f9f9f9"
-        color="#999999"
-
-        agt_triage [label="Triage Specialist\nDecides: handle it, or ask a person\n~162 tok desc", shape=box, fillcolor="#c8e6c9", style="filled,rounded"]
+        sta_attention_test_worker [label="Test Worker\nDoes sample work to exercise the system", shape=box, fillcolor="#80cbc4", style="filled,rounded"]
+        sta_attention_triage [label="Triage Assistant\nSorts incoming items and decides what to escalate", shape=box, fillcolor="#80cbc4", style="filled,rounded"]
     }
 
     subgraph cluster_modules {
-        label="Modules — Plug-In Code Components"
+        label="Modules — the working code behind the behaviors"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        mod_hooks_packet_approval [label="Approval Checkpoint\n(hooks-packet-approval)", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
-        mod_tool_request_decision [label="Put A Question To The Person\n(tool-request-decision)\n1 tool · ~334 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_hooks_packet_approval [label="Approval Watcher\nPauses the work until a person responds", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_tool_request_decision [label="Ask-a-Human Tool\nSends the question and returns the answer\n1 tool · ~334 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
     }
 
     subgraph cluster_context {
-        label="Context Files — Background Knowledge"
+        label="Reference Notes — background the assistant reads"
         style="filled"
         fillcolor="#f9f9f9"
         color="#999999"
 
-        ctx_attention_manager_awareness_md [label="How Attention Works — Plain Guide\nattention-manager-awareness.md\n~279 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
+        ctx_attention_manager_awareness_md [label="How & When To Ask For Attention\nattention-manager-awareness.md\n~279 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
     }
 
     subgraph cluster_legend {
-        label="Legend — What The Colors Mean"
+        label="Legend — what each color means"
         style="filled"
         fillcolor="white"
         color="#cccccc"
         fontsize=9
 
-        leg_root [label="main package", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
-        leg_behavior [label="capability pack", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
-        leg_agent [label="specialist helper", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
-        leg_module [label="code component", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
-        leg_provider [label="AI service", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
-        leg_context [label="background doc", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_root [label="main entry point", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
+        leg_behavior [label="behavior (skill pack)", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
+        leg_agent [label="agent (specialist helper)", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
+        leg_module [label="module (working code)", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
+        leg_provider [label="provider (AI model source)", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
+        leg_context [label="context (reference notes)", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
         leg_standalone [label="ready-to-run bundle", shape=box, fillcolor="#80cbc4", style="filled,rounded", fontsize=9]
-        leg_experiment [label="experiment", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
-        leg_ext_cost [label="outside this repo\n(adds cost)", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
-        leg_ext_muted [label="outside this repo\n(no added cost)", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
+        leg_experiment [label="experiment (in progress)", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_ext_cost [label="outside repo, adds cost", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
+        leg_ext_muted [label="outside repo, no cost", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
     }
 
-    disclaimer [label="Token estimates: ~4 chars/token\nSolid border = local (counted)\nDashed + red = external, hidden cost (not counted)\nDashed + muted = external, no cost\nExcludes: sub-session costs, runtime-dynamic", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
+    disclaimer [label="\"Tokens\" = how much reading material this adds for the AI (~4 chars/token)\nSolid border = lives in this repo (counted here)\nDashed + red = comes from elsewhere, adds cost not counted here\nDashed + muted = comes from elsewhere, adds no cost\nNot included: work done by spawned sub-sessions, anything decided at runtime", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
 
-    ext_githttps___github_com_microsoft_amplifier_foundation_main [label="Amplifier Foundation — shared base kit\n(external, cost)", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2]
+    ext_githttps___github_com_microsoft_amplifier_foundation_main [label="Amplifier Foundation\nShared base everything builds on\n(from another repo, adds cost)", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2]
 
     root_attention_manager -> ext_githttps___github_com_microsoft_amplifier_foundation_main [style=dashed]
     root_attention_manager -> beh_attention_manager_behavior [label="composes"]
