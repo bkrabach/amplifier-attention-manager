@@ -40,6 +40,25 @@ Requires tmux (fail-loud without it) and a working `amplifier` CLI on PATH
 (triage and the recipe-gate bridge shell out to it). Verify with
 `which attention-manager` (there is no `--version` flag yet).
 
+## Use from Amplifier sessions
+
+Normal Amplifier sessions can drive this whole flow themselves. The repo
+ships an owner-side bundle (root `bundle.md`) with an `attention-manager`
+skill covering the dispatch flows, the goal-derived judge pattern,
+redispatch-on-fail, and the verified footguns:
+
+```bash
+amplifier bundle add git+https://github.com/bkrabach/amplifier-attention-manager@main
+```
+
+Or compose just `behaviors/attention-manager.yaml` into your own bundle. The
+session then loads the skill before driving the CLI:
+`load_skill(skill_name="attention-manager")`.
+
+**Caveat (validated):** the skills tool's `config.skills` lists REPLACE
+across composed bundles — last wins. Composing multiple skill-shipping
+bundles requires merging the lists in your own `tool-skills` config.
+
 ## Start the manager (one terminal, leave it running)
 
 ```bash

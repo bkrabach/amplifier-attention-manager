@@ -1,0 +1,31 @@
+# attention-manager — OWNER-SIDE behavior: compose into a normal Amplifier
+# session so it can drive the attention-manager CLI well.
+#
+# Ships the `attention-manager` skill via the skills tool (a bundle CANNOT
+# ship skills via a top-level `skills:` key — that key is silently ignored;
+# tool-skills `config.skills` is the mechanism) plus a thin always-on
+# awareness pointer that tells the session to load the skill before driving
+# the CLI.
+#
+# Skill self-reference uses the FULL canonical git URL, not @self/relative —
+# relative refs escape the bundle root when this file is composed from
+# another repo and fail to resolve.
+#
+# CAVEAT (validated): tool-skills `config.skills` lists REPLACE across
+# composed bundles (last wins). Composing multiple skill-shipping bundles
+# requires merging the lists in your own config.
+
+bundle:
+  name: attention-manager-behavior
+  version: 0.1.0
+
+tools:
+  - module: tool-skills
+    source: git+https://github.com/microsoft/amplifier-bundle-skills@main#subdirectory=modules/tool-skills
+    config:
+      skills:
+        - "git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=skills"
+
+context:
+  include:
+    - attention-manager:context/attention-manager-awareness.md
