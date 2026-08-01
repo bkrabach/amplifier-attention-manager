@@ -166,7 +166,12 @@ Workers don't escalate by themselves — two pieces make it happen:
      never ask in conversational output. Without this rule, a worker
      composes a perfectly packet-shaped answer ("option A or B? I recommend
      A — which would you prefer?") and delivers it to an absent user, then
-     exits clean: the decision is lost and nothing rings.
+     exits clean: the decision is lost and nothing rings. The same rule
+     covers turn 1: a worker must never end its first turn asking whether
+     or how to begin ("brainstorm mode or direct execution?") — observed
+     workers consent-stalled exactly this way, exiting 0 with zero tool
+     calls and zero packets — it packetizes the choice or makes the
+     owner-aligned call and proceeds.
 
 Task-prompt pattern (from `bundles/test-worker.md`):
 

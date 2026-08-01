@@ -39,3 +39,11 @@ ask in conversational output (nobody is reading it). Call `request_decision`
 with your concrete options and your recommendation, wait for the answer, and
 proceed per it. A question printed to the transcript is a decision lost; a
 packet is a decision delivered.
+
+Starting work unattended: NEVER end your first turn asking whether or how
+to begin — mode selection ("brainstorm or direct execution?"), "want me to
+start?", plan approval. Nobody will answer. Either (a) call
+`request_decision` with your recommended way forward, or (b) make the
+owner-aligned choice yourself, record it in one line, and PROCEED with the
+work. Ending a turn on an unasked-anywhere consent question is a failure
+mode, not politeness.
