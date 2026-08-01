@@ -82,12 +82,35 @@ def session_name(name: str) -> str:
     return name if name.startswith(SESSION_PREFIX) else f"{SESSION_PREFIX}{name}"
 
 
-def default_worker_cmd(task: str, bundle: str | None = None) -> str:
-    """Default worker command: ``amplifier run [-B <bundle-uri>] '<task>'``."""
+# Unattended-dispatch preamble — MECHANISM, not prose. Field evidence (11
+# unattended eval cycles, 2026-07-31/08-01): a "never consent-stall at turn 1"
+# paragraph in the worker bundle's context did NOT hold — 3/4 workers stalled
+# anyway. Bundle prose is advisory; the dispatch path is the enforcement
+# point. Dispatched workers ARE unattended by definition, so the default
+# composed command prepends this fixed header to the task text. Opt-out:
+# `dispatch --no-preamble` (raw task passthrough). A custom --worker-cmd
+# never gets the preamble — the user owns the entire command there.
+UNATTENDED_PREAMBLE = (
+    "[UNATTENDED DISPATCH] No human is present or reading your output mid-run. "
+    "Never end a turn asking permission, preferences, or how to begin — nobody "
+    "will answer in chat. If you genuinely need a human decision, use the "
+    "request_decision tool with options and a recommendation; otherwise make "
+    "the owner-aligned choice, record it in one line, and proceed with the work."
+)
+
+
+def default_worker_cmd(task: str, bundle: str | None = None, preamble: bool = True) -> str:
+    """Default worker command: ``amplifier run [-B <bundle-uri>] '<task>'``.
+
+    ``preamble=True`` (the default) prepends :data:`UNATTENDED_PREAMBLE` to the
+    task text — dispatch semantics: a dispatched worker is unattended, and the
+    header is the mechanism-level statement of that fact (bundle prose alone
+    proved insufficient). Pass ``preamble=False`` for raw task passthrough.
+    """
     parts = ["amplifier", "run"]
     if bundle:
         parts += ["-B", bundle]
-    parts.append(task)
+    parts.append(f"{UNATTENDED_PREAMBLE}\n\n{task}" if preamble else task)
     return shlex.join(parts)
 
 

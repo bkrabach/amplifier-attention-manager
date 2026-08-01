@@ -196,6 +196,61 @@ class TestDispatchEarlyDeath:
         assert any(e["event"] == "worker:dispatch_failed" for e in events)
 
 
+class TestDispatchUnattendedPreamble:
+    """The unattended preamble is dispatch MECHANISM, not bundle prose (field
+    evidence, 11 unattended eval cycles 2026-07-31/08-01: a 'never
+    consent-stall at turn 1' paragraph was in context and 3/4 workers stalled
+    anyway). The composed default command carries it; --no-preamble is raw
+    task passthrough; a custom --worker-cmd is user-owned and never rewritten."""
+
+    @pytest.fixture(autouse=True)
+    def _no_wait(self, monkeypatch):
+        monkeypatch.setattr(cli, "DISPATCH_EARLY_DEATH_WAIT_S", 0.0)
+
+    @pytest.fixture(autouse=True)
+    def _quiet_observe(self, monkeypatch):
+        # Still-running observation → the early-death check stays quiet.
+        monkeypatch.setattr(
+            workers,
+            "observe",
+            lambda s, p: Observation(alive=True, exit_code=None, sentinel_seen=False, session_id=None),
+        )
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_launch(name, cmd, home_path, task=None, judge_cmd=None):
+            seen["cmd"] = cmd
+            seen["task"] = task
+            session = f"am-{name}"
+            d = home_path / "workers" / session
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "worker.log").write_text("", encoding="utf-8")
+            return {"name": name, "session": session, "cmd": cmd, "task": task, "judge_cmd": judge_cmd}
+
+        monkeypatch.setattr(workers, "launch", fake_launch)
+        return seen
+
+    def test_preamble_present_by_default(self, home, queue_root, captured):
+        assert main(["dispatch", "pre1", "--task", "do the thing"]) == 0
+        assert "[UNATTENDED DISPATCH]" in captured["cmd"]
+        assert "do the thing" in captured["cmd"]
+        # meta.json keeps the RAW task — the preamble is command composition,
+        # not task mutation.
+        assert captured["task"] == "do the thing"
+
+    def test_no_preamble_is_raw_passthrough(self, home, queue_root, captured):
+        assert main(["dispatch", "pre2", "--task", "do the thing", "--no-preamble"]) == 0
+        assert "[UNATTENDED DISPATCH]" not in captured["cmd"]
+        assert captured["cmd"] == workers.default_worker_cmd("do the thing", preamble=False)
+
+    def test_custom_worker_cmd_never_gets_preamble(self, home, queue_root, captured):
+        assert main(["dispatch", "pre3", "--task", "do the thing", "--worker-cmd", "sleep 30"]) == 0
+        assert captured["cmd"] == "sleep 30"
+        assert "[UNATTENDED DISPATCH]" not in captured["cmd"]
+
+
 @requires_tmux
 class TestDispatchEarlyDeathRealTmux:
     """Regression (UX round 2, Sam STRIKE #1, reproduced twice): `dispatch

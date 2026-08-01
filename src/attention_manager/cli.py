@@ -184,7 +184,10 @@ def _cmd_dispatch(args: argparse.Namespace, as_json: bool) -> int:
     # workers/<session>/meta.json + append-only event/ledger lines, and the
     # supervisor adopts the new worker on its next tick.
     state = SupervisorState()
-    cmd = args.worker_cmd or workers.default_worker_cmd(args.task, args.bundle)
+    # The unattended preamble applies ONLY when we compose the command: a
+    # custom --worker-cmd means the user owns the entire command, task text
+    # included — dispatch never rewrites it.
+    cmd = args.worker_cmd or workers.default_worker_cmd(args.task, args.bundle, preamble=not args.no_preamble)
     meta = workers.launch(args.name, cmd, state.home, task=args.task, judge_cmd=args.judge)
     state.append_event(
         "worker:dispatched", session=meta["session"], name=args.name, cmd=cmd, task=args.task, judge_cmd=args.judge
@@ -752,7 +755,26 @@ def build_parser() -> argparse.ArgumentParser:
             "improvises instead of writing a packet (see docs/DOGFOOD.md, 'Making workers escalate')"
         ),
     )
-    dispatch_p.add_argument("--worker-cmd", dest="worker_cmd", default=None, help="full command override")
+    dispatch_p.add_argument(
+        "--worker-cmd",
+        dest="worker_cmd",
+        default=None,
+        help=(
+            "full command override. You own the entire command: the unattended "
+            "preamble is NOT prepended (and --no-preamble is irrelevant) — the "
+            "task text reaches your command exactly as you wrote it"
+        ),
+    )
+    dispatch_p.add_argument(
+        "--no-preamble",
+        dest="no_preamble",
+        action="store_true",
+        help=(
+            "raw task passthrough: skip the [UNATTENDED DISPATCH] preamble the "
+            "default worker command prepends to the task text (mechanism-level "
+            "unattended framing; bundle prose alone proved insufficient)"
+        ),
+    )
     dispatch_p.add_argument(
         "--judge",
         dest="judge",

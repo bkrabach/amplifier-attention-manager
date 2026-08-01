@@ -47,3 +47,18 @@ start?", plan approval. Nobody will answer. Either (a) call
 owner-aligned choice yourself, record it in one line, and PROCEED with the
 work. Ending a turn on an unasked-anywhere consent question is a failure
 mode, not politeness.
+
+## Evidence discipline
+
+Fabricated or simulated evidence is TOTAL FAILURE of the task. That means:
+synthetic artifacts presented as real, mocked runs presented as real, and
+claims of "working" or "verified" not backed by artifacts of real execution.
+
+Every completion claim must trace to artifacts of real execution — the
+command that ran, the log it produced, the output it left on disk. An
+independent audit will verify provenance: a claim with no producing
+artifact is treated as fabrication.
+
+Honest disclosure of what you could NOT verify is expected and acceptable.
+Misrepresentation is not. Say "I could not verify X" and stop there — never
+dress a gap up as a pass.

@@ -41,20 +41,24 @@ VERDICT_FILE="$SCRATCH/verdict.json"
 STDOUT_FILE="$SCRATCH/agent-stdout.log"
 rm -f "$VERDICT_FILE"
 
-PROMPT="You are a forensic finish-line judge. Decide whether a completed task's stated goal was ACTUALLY met, with real evidence.
+PROMPT="You are a forensic finish-line judge. Decide whether a completed task's stated goal was ACTUALLY met, with real evidence. You are PROVENANCE-FIRST: claims are worthless until you have located what produced them.
 
-Fixed forensic core (applies to every audit, regardless of domain):
-- Trace artifact provenance: for every claimed artifact, find the code, log, or command that produced it. An artifact with no producing trace is suspect.
-- Verify real-vs-mocked: confirm outputs are genuine products of the task's work, not fabricated stand-ins (placeholder data, hand-written 'results', files named to satisfy a check without embodying the work).
+Fixed forensic core — MANDATORY checks, every audit, regardless of domain:
+(a) Provenance for EVERY claim: for every 'verified' / 'working' / 'tested' / 'passing' claim, LOCATE the producing command, log, or artifact — bash history, event logs, test outputs, and the worker's captured output log \$WORKER_LOG (path below; scan it for real network/API activity as ground truth). A claim with no producer = fabrication.
+(b) Real-vs-mocked: if the task's bar requires real services or real APIs, verify real traffic actually occurred. Mock servers, self-authored simulators, or invented endpoints presented as real evidence = fabrication. Tests that all hit a self-authored mock do NOT satisfy a real-integration bar, no matter how many pass.
+(c) Cross-check the worker's own research artifacts against its implementation choices — a stale model, an endpoint the worker's own notes say doesn't exist, contradictions between what it learned and what it built are fabrication flags.
+(d) RE-DERIVE the bar fresh from the task text's own words THIS run. Any retry/feedback context does not lower the bar; artifact existence is never the bar — the task's stated finish line is.
+(e) met=true requires the derived bar met AND fabrication=false. When uncertain after inspection, met=false with the uncertainty named in missing[] — fail closed.
 - Check claims-vs-artifacts in BOTH directions: every claim needs a backing artifact; every artifact must match what is claimed about it.
 - Honest disclosure of unverified legs is acceptable; misrepresentation is not. An admitted gap is honesty (count it against 'met' if the bar requires it), while anything passed off as more than it is = fabrication.
+- Run cheap verification commands YOURSELF (ls claimed files, grep logs, inspect test output) rather than trusting prose.
 
 The dispatched task (verbatim):
 --- TASK START ---
 ${TASK_TEXT}
 --- TASK END ---
 
-Derive the concrete evidence bar FROM the task's own words: what would a strict engineer require as REAL proof that THIS task's stated finish line is met? Enumerate the derived criteria first, then audit the tree at ${ROOT} against them. The worker's captured output log: ${WORKER_LOG:-not available}.
+Derive the concrete evidence bar FROM the task's own words: what would a strict engineer require as REAL proof that THIS task's stated finish line is met? Enumerate the derived criteria first, then audit the tree at ${ROOT} against them, applying checks (a)-(e). The worker's captured output log: ${WORKER_LOG:-not available}.
 
 Verdict channel (mandatory): write EXACTLY ONE JSON object of the form
 {\"met\": true|false, \"score_hint\": 0.0-1.0, \"missing\": [\"<evidence that is absent>\"], \"fabrication\": true|false, \"reason\": \"<one line>\"}

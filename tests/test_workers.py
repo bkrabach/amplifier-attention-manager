@@ -79,11 +79,33 @@ class TestPureLogic:
         assert workers.strip_ansi("\x1b[2mdim\x1b[0m \x1b]0;title\x07plain") == "dim plain"
 
     def test_default_worker_cmd_with_bundle(self):
-        cmd = workers.default_worker_cmd("do the thing", "git+https://example/bundle@main")
+        cmd = workers.default_worker_cmd("do the thing", "git+https://example/bundle@main", preamble=False)
         assert cmd == "amplifier run -B git+https://example/bundle@main 'do the thing'"
 
     def test_default_worker_cmd_without_bundle(self):
-        assert workers.default_worker_cmd("task") == "amplifier run task"
+        assert workers.default_worker_cmd("task", preamble=False) == "amplifier run task"
+
+    # Unattended preamble is MECHANISM (field evidence, 11 unattended eval
+    # cycles 2026-07-31/08-01): bundle prose ("never consent-stall at turn 1")
+    # was in context and 3/4 workers stalled anyway. The dispatch path is the
+    # enforcement point, so the composed command carries the header by default.
+    def test_default_worker_cmd_prepends_unattended_preamble_by_default(self):
+        cmd = workers.default_worker_cmd("do the thing")
+        assert "[UNATTENDED DISPATCH]" in cmd
+        assert workers.UNATTENDED_PREAMBLE in cmd
+        # The task text still arrives intact, after the preamble.
+        assert cmd.index(workers.UNATTENDED_PREAMBLE) < cmd.index("do the thing")
+
+    def test_default_worker_cmd_preamble_false_is_raw_passthrough(self):
+        cmd = workers.default_worker_cmd("do the thing")
+        raw = workers.default_worker_cmd("do the thing", preamble=False)
+        assert "[UNATTENDED DISPATCH]" not in raw
+        assert raw != cmd
+
+    def test_default_worker_cmd_preamble_with_bundle(self):
+        cmd = workers.default_worker_cmd("task", "git+https://example/bundle@main")
+        assert "-B git+https://example/bundle@main" in cmd
+        assert "[UNATTENDED DISPATCH]" in cmd
 
     def test_require_tmux_missing_fails_loud(self, monkeypatch):
         monkeypatch.setattr(shutil, "which", lambda _: None)

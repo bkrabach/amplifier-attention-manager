@@ -78,6 +78,16 @@ attention-manager dispatch portfix \
 - A worker that dies within ~3s of dispatch on a bundle/module load failure
   (or a nonzero exit) is reported LOUDLY by `dispatch` itself (nonzero exit +
   log path) — no more silent instant deaths.
+- **Unattended preamble (automatic).** The default composed worker command
+  prepends a fixed `[UNATTENDED DISPATCH]` header to the task text: no human
+  is reading mid-run, never end a turn asking permission or how to begin,
+  use `request_decision` for genuine decisions, otherwise make the
+  owner-aligned call and proceed. This is MECHANISM, not bundle prose —
+  field evidence (11 unattended eval cycles): the equivalent paragraph in
+  the worker bundle's context did not hold, 3/4 workers consent-stalled
+  anyway. Opt out with `dispatch --no-preamble` (raw task passthrough). A
+  custom `--worker-cmd` never gets the preamble — you own the entire
+  command there.
 - `--judge` gates the finish line: exit 0 → `loop:closed`, nonzero →
   `loop:failed` (loud + bell). No judge → the worker finishes unjudged —
   but an unjudged worker that dies with a nonzero exit is still loud
@@ -117,6 +127,20 @@ bidirectional claims-vs-artifacts). Mechanical checklists get gamed — a worker
 once fabricated sine-wave WAVs named as speech to satisfy a wav-exists check;
 the goal-derived bar is the non-overfit design that held in the 2026-07-31
 autonomy evals.
+
+The judge is **provenance-first** with mandatory checks written into its
+prompt: every "verified/working/tested/passing" claim must trace to the
+producing command/log/artifact (`$WORKER_LOG` is scanned for real
+network/API activity as ground truth — a claim with no producer =
+fabrication); if the task's bar requires real services/APIs, mock servers
+and invented endpoints presented as real evidence = fabrication; the
+worker's own research is cross-checked against its implementation choices;
+the bar is re-derived fresh from the task text each run (retry/feedback
+context never lowers it; artifact existence is never the bar); and the
+judge fails closed — uncertain after inspection means `met=false` with the
+uncertainty in the missing list. Hardened after a false-release where
+"12/12 E2E" all hit a self-authored mock and the bar drifted from "is it
+real" to "do artifacts exist".
 
 Canonical dispatch (task text saved to a file, judged against the work tree):
 
