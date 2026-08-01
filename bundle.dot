@@ -1,0 +1,98 @@
+// The attention-manager repository packages an Amplifier assistant that notices when automated work needs a human decision, pauses, asks the person, and resumes with their answer.
+digraph attention_manager {
+    rankdir=LR
+    fontname="Helvetica"
+    fontsize=12
+    label="Attention Manager v0.1.0 — bundle repository\nLets automated work pause, ask a person for a decision, and continue with the answer"
+    labelloc=t
+    labeljust=c
+    nodesep=0.6
+    ranksep=0.7
+    bgcolor="white"
+    source_hash="1fe4ded225efb25faad8cceaf065e208f57eb6597654ace9e030f29d29916e7f"
+
+    node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
+    edge [fontname="Helvetica", fontsize=9]
+
+    root_attention_manager [label="Attention Manager v0.1.0\nThe main package everything else builds on\n0 tools · 0 agents\n~402 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+
+    subgraph cluster_behaviors {
+        label="Skill Packages (Behaviors)"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        beh_attention_manager_behavior [label="Knowing When To Ask A Person\n1 tools · 1 ctx\n~587 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+        beh_packet_escalation [label="Sending The Question To A Person\n2 tools\n~304 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+    }
+
+    subgraph cluster_standalones {
+        label="Ready-To-Run Setups"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        sta_attention_test_worker [label="Practice Worker\nRuns the loop end to end for testing", shape=box, fillcolor="#80cbc4", style="filled,rounded"]
+        sta_attention_triage [label="Question Sorter Setup\nReviews incoming questions in batches", shape=box, fillcolor="#80cbc4", style="filled,rounded"]
+    }
+
+    subgraph cluster_agents {
+        label="Specialist Helpers (Agents)"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        agt_triage [label="Question Sorter\nDecides: answer it, ask a person, or drop it\n~162 tok desc", shape=box, fillcolor="#c8e6c9", style="filled,rounded"]
+    }
+
+    subgraph cluster_modules {
+        label="Working Parts (Code Modules)"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        mod_hooks_packet_approval [label="Approval Checkpoint\nHolds the work until a person replies", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+        mod_tool_request_decision [label="Ask A Person Button\n1 tool · ~334 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+    }
+
+    subgraph cluster_context {
+        label="Written Guidance (Context Files)"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        ctx_attention_manager_awareness_md [label="House Rules For Interrupting A Person\nattention-manager-awareness.md\n~279 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
+    }
+
+    subgraph cluster_legend {
+        label="Legend"
+        style="filled"
+        fillcolor="white"
+        color="#cccccc"
+        fontsize=9
+
+        leg_root [label="root bundle", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
+        leg_behavior [label="behavior", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
+        leg_agent [label="agent", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
+        leg_module [label="module", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
+        leg_provider [label="provider", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
+        leg_context [label="context", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_standalone [label="standalone", shape=box, fillcolor="#80cbc4", style="filled,rounded", fontsize=9]
+        leg_experiment [label="experiment", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_ext_cost [label="ext+cost", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
+        leg_ext_muted [label="ext+no-cost", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
+    }
+
+    disclaimer [label="Token estimates: ~4 chars/token\nSolid border = local (counted)\nDashed + red = external, hidden cost (not counted)\nDashed + muted = external, no cost\nExcludes: sub-session costs, runtime-dynamic", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
+
+    ext_githttps___github_com_microsoft_amplifier_foundation_main [label="Amplifier Foundation\nShared building blocks from another project\n(external, cost)", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2]
+
+    root_attention_manager -> ext_githttps___github_com_microsoft_amplifier_foundation_main [style=dashed]
+    root_attention_manager -> beh_attention_manager_behavior [label="composes"]
+    beh_attention_manager_behavior -> ctx_attention_manager_awareness_md [style=dotted, color=purple]
+    beh_packet_escalation -> mod_tool_request_decision [label="uses", penwidth=0.8]
+    beh_packet_escalation -> mod_hooks_packet_approval [label="uses", penwidth=0.8]
+    root_attention_manager -> ctx_attention_manager_awareness_md [style=dotted, color=purple]
+    sta_attention_test_worker -> root_attention_manager [label="extends", style=dashed]
+    sta_attention_triage -> root_attention_manager [label="extends", style=dashed]
+}

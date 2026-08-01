@@ -18,6 +18,7 @@
 bundle:
   name: attention-manager-behavior
   version: 0.1.0
+  description: Owner-side behavior — ships the attention-manager skill plus a thin awareness pointer so a session can drive the CLI (dispatch judge-gated workers, answer packets)
 
 tools:
   - module: tool-skills
