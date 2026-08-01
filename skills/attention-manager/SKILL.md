@@ -124,7 +124,14 @@ denominator).
 On `loop:failed` the goal judge prints `FAIL: <reason>` plus
 `MISSING: <evidence absent>` lines — WHAT is missing, never HOW to build it.
 
-1. Read the verdict (notify sink or the worker's log/judge scratch).
+1. Read the verdict from the durable record — NOT the notify sink:
+   `tail ~/.amplifier/attention/events.jsonl` (`loop:failed` carries the
+   `judge_output` tail), `attention-manager ledger --summary`, or
+   `attention-manager --json status` (per-worker `loop` field). Full judge
+   output: `$ATTENTION_HOME/workers/am-<name>/judge.log`. Notify-sink
+   delivery is batched and only flushes while the supervisor keeps running —
+   a quick round-trip can end with the `file:` sink never created even
+   though the verdict is in the ledger.
 2. Feed the MISSING lines forward **verbatim** into the next task text:
    `"previous attempt failed the finish line; absent evidence: <MISSING lines>"`.
 3. Redispatch with a **new worker name per cycle** (`mywork-r2`, `mywork-r3`).
@@ -161,9 +168,33 @@ The bar stays goal-derived; the worker gets the gap, not the answer.
   export ATTENTION_HOME=/tmp/am-sandbox ATTENTION_QUEUE_DIR=/tmp/am-sandbox/queue
   ```
 
+  A shell `export` only covers processes started FROM that shell. A
+  supervisor launched into its own tmux session gets its env from the tmux
+  server, not your shell — put the vars INSIDE the tmux command string:
+
+  ```bash
+  tmux new-session -d -s am-sup \
+    'ATTENTION_HOME=/tmp/am-sandbox ATTENTION_QUEUE_DIR=/tmp/am-sandbox/queue \
+     attention-manager supervise --interval 5 --judge-timeout 1800'
+  ```
+- **`--task` is required even with `--worker-cmd`** (argparse
+  `required=True`). With a custom `--worker-cmd` the command is yours
+  entirely — the task text is not embedded in it, but it is still recorded
+  in worker metadata and shown by `status`. Pass a stub:
+
+  ```bash
+  attention-manager dispatch smoke --task 'smoke: worker-cmd owns the command' --worker-cmd 'exit 0'
+  ```
+
 - **Every `amplifier tool invoke` costs one amplifier session** in the
   invoking project's store. Run the supervisor from `$HOME`, never a project
   dir.
-- **Bells are transient; the notify sink is the durable record.** A finished
-  worker's tmux session (and its bell) goes away — read
-  `file:`/`ntfy:`/`console` notifications and `queue list` for history.
+- **Bells are transient; the ledger + events are the durable record.** A
+  finished worker's tmux session (and its bell) goes away. Loop verdicts and
+  escalations ALWAYS land in `$ATTENTION_HOME/events.jsonl` and the ledger
+  (`ledger --summary`) — read those (plus `queue list`) for history. The
+  notify sink (`file:`/`ntfy:`/`console`) is a batched announcement channel
+  for packets and finish lines: items flush on a window/max policy only
+  while the supervisor is running, so a short run can end with the `file:`
+  sink never created and "Notification batches: 0" even though every
+  verdict is in the ledger.

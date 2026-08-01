@@ -31,3 +31,16 @@ own bundle. Either way, sessions load the skill on demand:
 **Caveat (validated):** the skills tool's `config.skills` lists REPLACE across
 composed bundles — last wins. If you compose multiple skill-shipping bundles,
 merge their skill lists in your own `tool-skills` config override.
+
+**Troubleshooting — "Not a valid bundle: missing bundle.md" (hit live):**
+sessions that referenced this repo as a bundle source before the bundle
+landed (commit `6829f37`) keep a stale shallow clone under
+`~/.amplifier/cache/`. Refresh it:
+
+```bash
+d=$(ls -d ~/.amplifier/cache/amplifier-attention-manager-*) \
+  && git -C "$d" fetch --depth 1 origin main \
+  && git -C "$d" reset --hard origin/main
+```
+
+(or run `amplifier update`).

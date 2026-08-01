@@ -59,6 +59,19 @@ session then loads the skill before driving the CLI:
 across composed bundles — last wins. Composing multiple skill-shipping
 bundles requires merging the lists in your own `tool-skills` config.
 
+**Troubleshooting — "Not a valid bundle: missing bundle.md" (hit live):**
+sessions that referenced this repo as a bundle source before the bundle
+landed (commit `6829f37`) keep a stale shallow clone under
+`~/.amplifier/cache/`. Refresh it:
+
+```bash
+d=$(ls -d ~/.amplifier/cache/amplifier-attention-manager-*) \
+  && git -C "$d" fetch --depth 1 origin main \
+  && git -C "$d" reset --hard origin/main
+```
+
+(or run `amplifier update`).
+
 ## Start the manager (one terminal, leave it running)
 
 ```bash
@@ -235,9 +248,13 @@ the view.
 
 Bells are transient: a worker's tmux session ends shortly after the worker
 finishes and takes its bell flag with it, so without muxplex there may be no
-bell left to see. The notify sink (`file:` / `ntfy:` / `console`) is the
-durable record of escalations and finish lines — bells are the live-attention
-surface, not history.
+bell left to see. The durable record of escalations and finish lines is
+`$ATTENTION_HOME/events.jsonl` plus the ledger (`ledger --summary`) — bells
+are the live-attention surface, not history. The notify sink
+(`file:` / `ntfy:` / `console`) announces batches (packets and finish
+lines), but delivery is window/max batched and only flushes while the
+supervisor is running — a short run can end with the `file:` sink never
+created even though every verdict is in the ledger.
 
 NOTE: muxplex views filter what surfaces. If your active view is a curated one
 (not "all"), belled `am-*` sessions won't appear in it — add them to the view
