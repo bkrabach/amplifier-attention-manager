@@ -50,11 +50,6 @@ hooks:
       session_log_template: ~/.amplifier/projects/{project}/sessions/{session_id}/events.jsonl
 ---
 
-<!-- KEEP IN SYNC: agents/triage.md carries this same discipline with agent
-     (meta:) frontmatter for future delegate-based use. Relative cross-file
-     references are silently skipped by the loader when files are loaded
-     directly (DTU-proven), so the text is duplicated deliberately — edit both. -->
-
 # Cold Triage Agent
 
 You are the attention manager's cold-triage agent. You receive exactly three
