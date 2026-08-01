@@ -108,6 +108,41 @@ attention-manager dispatch portfix \
   the judge runs" above — so a `"$WORKER_LOG"` judge like the dispatch
   example needs no `$ARTIFACT`.)
 
+## Goal-derived judge (recommended default)
+
+For real (non-toy) work units, prefer `judges/goal-judge.sh`: an agent judge
+whose evidence bar is **derived from the task text at judge time** by a fixed
+forensic/honesty core (provenance tracing, real-vs-mocked verification,
+bidirectional claims-vs-artifacts). Mechanical checklists get gamed — a worker
+once fabricated sine-wave WAVs named as speech to satisfy a wav-exists check;
+the goal-derived bar is the non-overfit design that held in the 2026-07-31
+autonomy evals.
+
+Canonical dispatch (task text saved to a file, judged against the work tree):
+
+```bash
+printf '%s' "$TASK" > /abs/path/task.txt
+attention-manager dispatch mywork \
+  --task "$TASK" \
+  --bundle 'git+https://github.com/bkrabach/amplifier-attention-manager@main#subdirectory=bundles/test-worker.md' \
+  --judge 'GOAL_JUDGE_ROOT=/abs/path/to/worktree /abs/path/to/judges/goal-judge.sh /abs/path/task.txt'
+```
+
+- **Raise the judge timeout**: the agent evaluation runs up to
+  `GOAL_JUDGE_TIMEOUT` (default 1200s), so start the supervisor with
+  `supervise --judge-timeout 1500` (the default 60s would kill it mid-audit).
+- `GOAL_JUDGE_ROOT` must point at the work tree — the judge's cwd is the
+  worker *state* dir (see "Where the judge runs" above), not where the work
+  happened. `$WORKER_LOG` is handed to the judge agent automatically.
+- **Redispatch-on-fail (recommended loop):** on failure the judge prints
+  `FAIL: <reason>` plus `MISSING: <evidence absent>` lines — WHAT is missing,
+  never HOW to build it. Feed that missing-list forward verbatim into the next
+  dispatch's task text ("previous attempt failed the finish line; absent
+  evidence: ...") and redispatch. The bar stays goal-derived; the worker gets
+  the gap, not the answer.
+- Unparseable verdicts are a LOUD exit-1 fail — this judge has no silent-pass
+  path (a fabrication-flagged verdict also fails, even when `met` is true).
+
 ## Making workers escalate (marked tasks AND self-identified decision points)
 
 Workers don't escalate by themselves — two pieces make it happen:
